@@ -1,0 +1,14 @@
+{
+  "name": "session-sync",
+  "description": "End-of-session knowledge sync: summarise learnings, confirm with user, update CLAUDE.md and memory files, commit to git",
+  "version": "1.0.1",
+  "author": {
+    "name": "James Polley",
+    "email": "jamezpolley@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["memory", "session", "sync", "knowledge", "claude-md"],
+  "dependencies": [
+    { "name": "remember", "marketplace": "claude-plugins-official", "version": ">=0.5.0" }
+  ]
+}

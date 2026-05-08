@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "session-sync",
-      "source": "./",
+      "source": "./session-sync/",
       "description": "End-of-session knowledge sync: summarise learnings, confirm with user, update CLAUDE.md and memory files, commit to git",
       "keywords": ["memory", "session", "sync", "knowledge", "claude-md"]
     }
