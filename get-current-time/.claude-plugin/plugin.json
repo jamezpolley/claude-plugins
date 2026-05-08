@@ -1,0 +1,11 @@
+{
+  "name": "get-current-time",
+  "description": "Gets the current local time using whatever tools are available — user_time_v0, bash date, Desktop Commander, or Windows-MCP",
+  "version": "1.0.0",
+  "author": {
+    "name": "James Polley",
+    "email": "jamezpolley@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["time", "date", "clock", "timestamp"]
+}
