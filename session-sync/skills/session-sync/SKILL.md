@@ -5,27 +5,23 @@ description: This skill should be used when the user says "sync session", "save 
 
 # Session Knowledge Sync
 
-Capture and persist session learnings: summarise → confirm → update docs and memory → commit.
+Capture and persist session learnings: plan → approve → update docs and memory → commit.
 
-## Step 1 — Summarise
+## Step 1 — Enter plan mode and draft
 
-Present a structured summary covering:
+Call `EnterPlanMode` (skip if plan mode is already active — the user may have pre-entered). Build the sync plan in the plan file using these sections:
 
 - **Confirmed or corrected facts** — things now known with more certainty, or previous records that were wrong
 - **New patterns or rules** — behaviours, formulas, constraints discovered this session
-- **Data recorded** — tables written to, rows inserted, files changed
+- **Data recorded** — tables written to, rows inserted, files changed during the session (already happened; recording for the audit trail)
 - **Open questions** — things needing more data or follow-up
-- **Proposed doc changes** — specific edits intended for CLAUDE.md or reference files
+- **Proposed doc changes** — for each file you intend to edit, the specific addition/correction (paraphrase or diff). Name the file path explicitly.
 
-One sentence per item. Bullet points only.
+One sentence per item in the summary sections; specific file paths plus the actual edit content for the proposed changes.
 
-## Step 2 — Confirm
+Call `ExitPlanMode` to request approval. Do not proceed to Step 2 until the user approves. If the user corrects or edits the plan, the approved plan file (which may reflect their edits) is now the spec for the subsequent steps.
 
-Ask: *"Does this look right? Anything to correct or add before I write it all down?"*
-
-Do not proceed to Step 3 without explicit approval. Incorporate any corrections, then re-confirm if changes are substantial.
-
-## Step 3 — Update docs
+## Step 2 — Update docs
 
 ### CLAUDE.md
 
@@ -39,7 +35,7 @@ Edit surgically — add or correct only what changed this session. Do not rewrit
 
 Check CLAUDE.md for what reference files the project maintains and when to update them. Only update files that are relevant to this session's learnings.
 
-## Step 4 — Update memory
+## Step 3 — Update memory
 
 Check CLAUDE.md for the project's memory conventions. If no conventions are specified, default to a `memory/` folder in the project root.
 
@@ -61,7 +57,7 @@ For feedback/project types: lead with the rule/fact, then **Why:** and **How to 
 
 Update the `MEMORY.md` index whenever a file is added or changed.
 
-## Step 5 — Commit
+## Step 4 — Commit
 
 ```bash
 git add CLAUDE.md memory/ <any reference files changed>
@@ -74,5 +70,4 @@ If the project has a pre-commit hook that handles additional artefacts (DB dumps
 
 - Do not write data rows during sync — those happen during the session
 - Do not rewrite sections that haven't changed
-- Do not proceed past Step 2 without approval
 - Do not create new reference files that CLAUDE.md doesn't already describe
