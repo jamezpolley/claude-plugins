@@ -1,6 +1,6 @@
 {
   "name": "craft-projects",
-  "description": "Manage James's Craft vault project notes: create new crochet/knitting project notes from a template, and update project status as work progresses",
+  "description": "Manage a Craft vault's project notes: create new crochet/knitting project notes from a template, and update project status as work progresses",
   "version": "1.0.0",
   "author": {
     "name": "James Polley",

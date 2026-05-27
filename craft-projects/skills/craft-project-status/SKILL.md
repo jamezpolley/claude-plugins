@@ -1,15 +1,15 @@
 ---
 name: craft-project-status
-description: Updates the status of an existing craft project in James's Craft vault (C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft\Projects\). Use whenever James mentions completing a stage, finishing a project, frogging something, or moving a project forward — triggered by phrases like "I finished the shawl", "mark X as complete", "I frogged the slipper project", "I've started the hat", "update the status of Y", "I cast on the cardigan", "I've done the swatch for Z". Updates the YAML frontmatter status field and the Status checklist in the project file. Always use this skill rather than editing the file manually.
+description: Updates the status of an existing craft project in the crafter's Craft vault. Use whenever the crafter mentions completing a stage, finishing a project, frogging something, or moving a project forward — triggered by phrases like "I finished the shawl", "mark X as complete", "I frogged the slipper project", "I've started the hat", "update the status of Y", "I cast on the cardigan", "I've done the swatch for Z". Updates the YAML frontmatter status field and the Status checklist in the project file. Always use this skill rather than editing the file manually.
 ---
 
 # craft-project-status
 
 Updates the status of an existing project file in `Projects/`.
 
-## Vault details
+## Locating the vault
 
-- **Projects folder:** `C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft\Projects\`
+Resolve the **vault root** before editing: if the current working directory is inside the Craft vault (it contains the Craft `CLAUDE.md` and a `Projects/` folder), walk up to the folder containing `Projects/_template.md` and use that. Otherwise ask the crafter for the vault path. All work happens in the `Projects/` folder relative to that root.
 
 ## Valid statuses
 

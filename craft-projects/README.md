@@ -1,6 +1,6 @@
 # craft-projects
 
-Two skills for managing project notes in James's Craft vault (crochet & knitting).
+Two skills for managing project notes in a SeaDrive-synced Craft vault (crochet & knitting).
 
 ## Skills
 
@@ -16,4 +16,4 @@ Two skills for managing project notes in James's Craft vault (crochet & knitting
 
 ## Notes
 
-Both skills target the Craft vault at `C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft`. They are personal to that vault layout rather than general-purpose.
+Both skills resolve the Craft vault from the current working directory (the folder containing `CLAUDE.md` and `Projects/_template.md`), falling back to asking the crafter if it can't be found. They assume that vault layout — an Obsidian-style `Projects/` folder with a `_template.md` — rather than being fully general-purpose.

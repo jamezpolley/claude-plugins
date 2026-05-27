@@ -1,18 +1,24 @@
 ---
 name: new-craft-project
-description: Creates a new craft project note in James's Craft vault at C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft\Projects\. Use this whenever James wants to start tracking a new crochet or knitting project — triggered by things like "I'm starting a new project", "add a project for X pattern", "create a note for Y", "I want to track this shawl/hat/bag/slipper pattern", or "set up a project for [designer/pattern name]". Fills in an Obsidian-compatible markdown file with YAML frontmatter (yarn, hook, status, etc.) from the project template. Always use this skill rather than creating a file manually.
+description: Creates a new craft project note in the crafter's Craft vault. Use this whenever the crafter wants to start tracking a new crochet or knitting project — triggered by things like "I'm starting a new project", "add a project for X pattern", "create a note for Y", "I want to track this shawl/hat/bag/slipper pattern", or "set up a project for [designer/pattern name]". Fills in an Obsidian-compatible markdown file with YAML frontmatter (yarn, hook, status, etc.) from the project template. Always use this skill rather than creating a file manually.
 ---
 
 # new-craft-project
 
-Creates a new project note in `Projects/` inside James's Craft vault, populated from the standard template.
+Creates a new project note in `Projects/` inside the crafter's Craft vault, populated from the standard template.
 
-## Vault details
+## Locating the vault
 
-- **Root:** `C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft`
-- **Projects folder:** `C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft\Projects\`
-- **Template:** `C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft\Projects\_template.md`
-- **CLAUDE.md:** `C:\Users\jamez\.cache\seadrive\James\My Libraries\Craft\CLAUDE.md`
+The Craft vault is a SeaDrive-synced folder whose absolute path differs per machine and per user. Resolve the **vault root** before doing anything else, in this order:
+
+1. If the current working directory is inside the Craft vault (it contains a `CLAUDE.md` describing the "Craft" repo and a `Projects/` folder), use that — walk up from the cwd to find the folder containing `Projects/_template.md`.
+2. Otherwise ask the crafter for the vault path rather than guessing.
+
+All paths below are relative to that resolved **vault root**:
+
+- **Projects folder:** `Projects/`
+- **Template:** `Projects/_template.md`
+- **CLAUDE.md:** `CLAUDE.md`
 
 ## What to gather
 
