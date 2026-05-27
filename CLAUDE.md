@@ -45,3 +45,4 @@ The top-level `.claude-plugin/marketplace.json` registers this repo as the `jame
 
 - **session-sync** — end-of-session knowledge sync (summarise → confirm → update CLAUDE.md + memory → git commit). Depends on `remember@claude-plugins-official >=0.5.0`.
 - **get-current-time** — gets current local time via `user_time_v0`, `bash date`, Desktop Commander, or Windows-MCP, in that priority order.
+- **craft-projects** — manage Craft vault project notes; bundles two skills: `new-craft-project` (create a note from the template) and `craft-project-status` (update status + checklist).

@@ -19,5 +19,12 @@
       "description": "Gets the current local time using whatever tools are available — user_time_v0, bash date, Desktop Commander, or Windows-MCP",
       "keywords": ["time", "date", "clock", "timestamp"]
     }
+    ,
+    {
+      "name": "craft-projects",
+      "source": "./craft-projects/",
+      "description": "Manage James's Craft vault project notes: create new crochet/knitting project notes from a template, and update project status as work progresses",
+      "keywords": ["craft", "crochet", "knitting", "project", "notes", "obsidian"]
+    }
   ]
 }
