@@ -69,7 +69,9 @@ Write `.claude/tg-local-client/config.local.json` with the values collected so f
 
 ### 4. Store the bot token securely
 
-**IMPORTANT: never ask the user to paste the token into chat.** It would be stored in the session transcript in plaintext.
+**CRITICAL — this is the #1 rule for this entire step: the bot token must NEVER appear in the Claude Code chat or session transcript.** Transcripts are stored in plaintext at `~/.claude/projects/`. A token in chat is a token on disk, potentially in backups, logs, and future AI context windows.
+
+This means: do not ask for the token, do not have the user paste it, do not echo it back, do not include it in any message. If you are ever unsure whether a step would expose the token, choose the option that doesn't.
 
 #### 4a. Check if a token is already configured
 
