@@ -7,6 +7,8 @@ description: Agent brief for projects using the tg-local-client Telegram MCP. Co
 
 Your project has a per-project Telegram bot configured via tg-local-client. This brief covers how to use it.
 
+**Fleet comms conventions:** read `docs/fabric-comms-conventions.md` (in this plugin's base directory) before sending any messages. It is authoritative and owned by Dex (@tchlawbot) — do not paraphrase or summarise it here.
+
 ## Your MCP tools
 
 Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `mcp__<slug>-tg__*`. The 24 tools are:
@@ -48,9 +50,19 @@ Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `m
 
 ## Key behaviours
 
+### Acknowledge on Telegram FIRST — before any other work
+
+**When a message arrives that requires a response, your very first action must be to acknowledge it on Telegram.** Do not start researching, running commands, or thinking — send the acknowledgement first, then work.
+
+- **DMs:** call `stream_message_draft` immediately with `💭 thinking…`. Subsequent calls with the returned `message_id` edit it in place as you work. Finalise with `send_message`.
+- **Groups:** call `send_message` with `💭 thinking…` and a `reply_to_message_id` pointing at the inbound message. Keep the returned `telegram_msg_id`. Call `edit_message` at the end of your turn with the final answer.
+
+This is non-negotiable. A Telegram message that goes unacknowledged looks like you're offline or ignoring the sender.
+
+### Other behaviours
+
 - `send_message` defaults to `group_chat_ids[0]` — you normally don't pass `chat_id`
 - **Reactions reach humans but NOT other bots.** Use text replies for anything another agent must see.
-- `stream_message_draft` is the right tool for DMs: first call sends a `💭 thinking…` placeholder, subsequent calls with the returned `message_id` edit it in place.
 - `start_typing` (self-refreshing) for operations longer than ~5s; `send_typing` for short one-shot bursts.
 - `close_forum_topic` / `reopen_forum_topic` only work in supergroups. In DM chats, use `delete_forum_topic` to retire a topic.
 
