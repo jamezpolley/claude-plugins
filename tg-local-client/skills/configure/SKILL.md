@@ -15,25 +15,27 @@ Set up a per-project Telegram bot client for agent communication.
 > ```
 > Then re-run `/tg-local-client:configure`.
 
-## Step 0 — Gather information from the user
+## Prerequisites
 
-Tell the user you need four things, explaining each one clearly:
+Before running, have ready:
+- Bot slug (short identifier, e.g. `pod` or `chez`) — drives the data dir and MCP name
+- Bot's Telegram @username (without the `@`)
+- Chat ID of the coordination group the bot has been added to
+- Bot token (from BotFather — stays gitignored, never committed)
 
-1. **Bot slug** — a short lowercase identifier you choose for this bot, e.g. `pod` for a pod-upload-app bot or `chez` for a chezmoi bot. It determines the MCP server name (`<slug>-tg`) and the local data directory. Pick something short that identifies this project.
+If you don't have these, collect them as follows:
 
-2. **Bot's Telegram @username** — the username of the Telegram bot assigned to this project (without the leading `@`). If the user doesn't know it, they can find it in Telegram by messaging @BotFather with `/mybots`.
+**Slug:** Use AskUserQuestion — suggest 2-3 options derived from the project name (e.g. for `pod-upload-app` suggest `pod`, `upload`, `pod-upload`), plus the user can select "Other" to type their own. AskUserQuestion requires at least 2 options; derive them from the project name/directory.
 
-3. **Coordination group chat ID** — the numeric Telegram chat ID of the group this bot has been added to (negative number, e.g. `-1003730692254`). If the user doesn't know it, they can find it by adding @userinfobot to the group.
+**Username, chat ID, token:** Ask for these as plain text in a single follow-up message — do NOT use AskUserQuestion for these (no meaningful options to suggest, and the tool requires ≥2 options per question).
 
-4. **Bot token** — the secret token from BotFather for this bot. It looks like `123456789:AAH...`. It will be stored in `.env` (gitignored) and never committed.
+## Steps
 
-Ask for all four in a single message. Don't proceed until you have them all.
-
-## Step 1 — Check for existing install
+### 1. Check for existing install
 
 If `.claude/tg-local-client/` already exists, skip to step 3.
 
-## Step 2 — Clone tg-local-client
+### 2. Clone tg-local-client
 
 ```bash
 git clone https://github.com/jamezpolley/tg-local-client.git .claude/tg-local-client
@@ -44,7 +46,7 @@ Add to `.gitignore` (append, don't overwrite):
 .claude/tg-local-client/
 ```
 
-## Step 3 — Write config.local.json
+### 3. Write config.local.json
 
 Write `.claude/tg-local-client/config.local.json` with the values provided:
 
@@ -60,7 +62,7 @@ Write `.claude/tg-local-client/config.local.json` with the values provided:
 
 `mcp_name` left empty defaults to `<slug>-tg`. Set it explicitly only if the slug-derived name would conflict.
 
-## Step 4 — Merge token into .env
+### 4. Merge token into .env
 
 Read the existing `.env` if present. **Only append** — never overwrite existing values.
 
@@ -74,7 +76,7 @@ TG_BOT_TOKEN=<token>
 
 Add `.env` to `.gitignore` if not already present. If `.env` is already gitignored (e.g. via `*.env` or a devcontainer pattern), note that and skip.
 
-## Step 5 — Register MCP server in .mcp.json
+### 5. Register MCP server in .mcp.json
 
 Create or update `.mcp.json` in the project root. Merge — preserve any existing entries.
 
@@ -94,11 +96,11 @@ The entry to add (replace `<abs-path>` with the absolute path to `.claude/tg-loc
 }
 ```
 
-## Step 6 — Allow MCP tools in .claude/settings.json
+### 6. Allow MCP tools in .claude/settings.json
 
 Add `"mcp__<slug>-tg__*"` to `permissions.allow` in `.claude/settings.json`. Merge with existing permissions.
 
-## Step 7 — Summary
+### 7. Summary
 
 Tell the user:
 - MCP server name: `<slug>-tg`
