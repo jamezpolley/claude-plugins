@@ -7,6 +7,14 @@ description: Bootstrap a per-project tg-local-client Telegram bot. Clones the cl
 
 Set up a per-project Telegram bot client for agent communication.
 
+> **Installing this plugin for the first time?**
+> ```
+> /plugin marketplace add jamezpolley/claude-plugins
+> /plugin install tg-local-client@jamezpolley --scope project
+> /reload-plugins
+> ```
+> Then re-run `/tg-local-client:configure`.
+
 ## Prerequisites
 
 Before running, have ready:
