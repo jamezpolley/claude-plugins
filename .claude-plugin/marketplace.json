@@ -45,6 +45,19 @@
       ]
     },
     {
+      "name": "tg-local-client",
+      "source": "./tg-local-client/",
+      "description": "Per-project Telegram bot client for agent communication. Configure skill bootstraps a project-local clone with MCP registration, .env token injection, and .gitignore setup. Agent brief covers tools, session startup, and migration from the dex-fabric client.",
+      "keywords": [
+        "telegram",
+        "mcp",
+        "agent",
+        "communication",
+        "bot",
+        "fabric"
+      ]
+    },
+    {
       "name": "dex-fabric-grocy",
       "source": "./dex-fabric-grocy/",
       "description": "Persistent Grocy inventory bot for the Dex fabric \u2014 Telegram-gated, loops on inbound from James, applies Grocy updates and replies",
