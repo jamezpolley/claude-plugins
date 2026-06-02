@@ -71,7 +71,31 @@ Write `.claude/tg-local-client/config.local.json` with the values collected so f
 
 **IMPORTANT: never ask the user to paste the token into chat.** It would be stored in the session transcript in plaintext.
 
-#### 4a. Detect available secret managers
+#### 4a. Check if a token is already configured
+
+First check if `TG_BOT_TOKEN` is already set in the environment or in an existing `.env` / `mise.local.toml`:
+
+```bash
+echo "env:${#TG_BOT_TOKEN}"
+grep -s TG_BOT_TOKEN .env mise.local.toml 2>/dev/null | head -3
+```
+
+If the token is already present and non-empty, skip to step 5.
+
+#### 4b. Check for an .env.sample or .env.example
+
+If no token is set, check whether the project has a sample env file:
+
+```bash
+ls .env.sample .env.example 2>/dev/null
+```
+
+If one exists, tell the user the simplest path:
+> "The easiest way to set up your token: copy `.env.sample` to `.env`, then open `.env` in your editor and replace the placeholder with your bot token. Add `.env` to `.gitignore` if it isn't already."
+
+Wait for them to do this, then re-check step 4a before continuing. If they prefer a more secure method (keychain, 1Password, mise), continue to 4c.
+
+#### 4c. Detect available secret managers
 
 Run the following to detect what's available:
 
@@ -83,7 +107,7 @@ echo "secret-tool:$(which secret-tool 2>/dev/null && echo yes || echo no)"
 echo "security:$(which security 2>/dev/null && echo yes || echo no)"
 ```
 
-#### 4b. Present options to the user
+#### 4d. Present options to the user
 
 Use AskUserQuestion to ask how they want to store the token. Only offer options for tools that are available. Order by preference (most secure first). Always include `.env file` as a fallback. Include at least 2 options (required by AskUserQuestion).
 
@@ -97,7 +121,7 @@ Use AskUserQuestion to ask how they want to store the token. Only offer options 
 | `security` available | **macOS Keychain** | Token stored in macOS Keychain via `security`. Retrieved at shell startup. |
 | Always | **.env file** | Token written to `.env` using a silent terminal read — never echoed. Simple and portable. |
 
-#### 4c. If user chooses **1Password**
+#### 4e. If user chooses **1Password**
 
 Ask a follow-up (AskUserQuestion with 2 options):
 - **op run wrapper** — .mcp.json wraps the command with `op run`; token only exists for the subprocess lifetime. More secure.
@@ -124,7 +148,7 @@ For **environment variable**: instruct the user to add to their shell profile (e
 export TG_BOT_TOKEN=$(op read "op://<vault>/<item>/<field>")
 ```
 
-#### 4d. If user chooses **mise**
+#### 4f. If user chooses **mise**
 
 Tell the user to run this in their terminal (use `! <command>` in Claude Code to avoid the token appearing in chat):
 
@@ -136,7 +160,7 @@ Tell the user: "Run this in your terminal — the token will be written directly
 If `mise.local.toml` doesn't exist, create it first with just `[env]` and have the user append to it.
 Add `mise.local.toml` to `.gitignore` if not already present.
 
-#### 4e. If user chooses **Linux keyring** (`secret-tool`)
+#### 4g. If user chooses **Linux keyring** (`secret-tool`)
 
 Tell the user to run in their terminal:
 ```
@@ -148,7 +172,7 @@ Then add to their shell profile to export it:
 export TG_BOT_TOKEN=$(secret-tool lookup service telegram-bot account <slug>)
 ```
 
-#### 4f. If user chooses **macOS Keychain** (`security`)
+#### 4h. If user chooses **macOS Keychain** (`security`)
 
 Tell the user to run in their terminal:
 ```
@@ -160,7 +184,7 @@ Then add to their shell profile to export it:
 export TG_BOT_TOKEN=$(security find-generic-password -s "tg-<slug>" -a "telegram-bot" -w)
 ```
 
-#### 4g. If user chooses **.env file**
+#### 4i. If user chooses **.env file**
 
 Tell the user to run this in their terminal (the token is read silently and written directly to `.env`):
 ```
@@ -170,7 +194,7 @@ Tell the user: "Run this in your terminal:
 
 Add `.env` to `.gitignore` if not already present.
 
-#### 4h. Verify the token is accessible
+#### 4j. Verify the token is accessible
 
 After the user completes their chosen method, verify the token is reachable without reading its value:
 
