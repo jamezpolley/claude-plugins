@@ -4,27 +4,58 @@
     "name": "James Polley",
     "email": "jamezpolley@gmail.com"
   },
-  "allowCrossMarketplaceDependenciesOn": ["claude-plugins-official"],
+  "allowCrossMarketplaceDependenciesOn": [
+    "claude-plugins-official"
+  ],
   "plugins": [
     {
       "name": "session-sync",
       "source": "./session-sync/",
       "description": "End-of-session knowledge sync: summarise learnings, confirm with user, update CLAUDE.md and memory files, commit to git",
-      "keywords": ["memory", "session", "sync", "knowledge", "claude-md"]
-    }
-    ,
+      "keywords": [
+        "memory",
+        "session",
+        "sync",
+        "knowledge",
+        "claude-md"
+      ]
+    },
     {
       "name": "get-current-time",
       "source": "./get-current-time/",
-      "description": "Gets the current local time using whatever tools are available — user_time_v0, bash date, Desktop Commander, or Windows-MCP",
-      "keywords": ["time", "date", "clock", "timestamp"]
-    }
-    ,
+      "description": "Gets the current local time using whatever tools are available \u2014 user_time_v0, bash date, Desktop Commander, or Windows-MCP",
+      "keywords": [
+        "time",
+        "date",
+        "clock",
+        "timestamp"
+      ]
+    },
     {
       "name": "craft-projects",
       "source": "./craft-projects/",
       "description": "Manage a Craft vault's project notes: create new crochet/knitting project notes from a template, and update project status as work progresses",
-      "keywords": ["craft", "crochet", "knitting", "project", "notes", "obsidian"]
+      "keywords": [
+        "craft",
+        "crochet",
+        "knitting",
+        "project",
+        "notes",
+        "obsidian"
+      ]
+    },
+    {
+      "name": "dex-fabric-grocy",
+      "source": "./dex-fabric-grocy/",
+      "description": "Persistent Grocy inventory bot for the Dex fabric \u2014 Telegram-gated, loops on inbound from James, applies Grocy updates and replies",
+      "keywords": [
+        "grocy",
+        "inventory",
+        "telegram",
+        "fabric",
+        "dex",
+        "shopping"
+      ]
     }
   ]
 }

@@ -1,0 +1,5 @@
+{
+  "name": "dex-fabric-grocy",
+  "version": "1.0.0",
+  "description": "Persistent Grocy inventory bot for the Dex fabric — Telegram-gated, loops on inbound from James, applies Grocy updates and replies"
+}
