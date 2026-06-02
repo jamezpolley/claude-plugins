@@ -97,118 +97,44 @@ Wait for them to do this, then re-check step 4a before continuing. If they prefe
 
 #### 4c. Detect available secret managers
 
-Run the following to detect what's available:
-
 ```bash
 echo "op:$(which op 2>/dev/null && echo yes || echo no)"
 echo "mise:$(which mise 2>/dev/null && echo yes || echo no)"
-echo "mise-local:$(test -f mise.local.toml && echo yes || echo no)"
 echo "secret-tool:$(which secret-tool 2>/dev/null && echo yes || echo no)"
 echo "security:$(which security 2>/dev/null && echo yes || echo no)"
 ```
 
-#### 4d. Present options to the user
+#### 4d. Present options and guide the user
 
-Use AskUserQuestion to ask how they want to store the token. Only offer options for tools that are available. Order by preference (most secure first). Always include `.env file` as a fallback. Include at least 2 options (required by AskUserQuestion).
+Use AskUserQuestion to ask how they want to store the token. Only offer options for tools that are detected. Always include `.env file` as a fallback. At least 2 options required.
 
 **Available options** (show only if detected):
 
-| Option | Label | Description |
-|--------|-------|-------------|
-| `op` available | **1Password** | Token stored in 1Password vault; never touches disk. Offers sub-choice: op run wrapper (most secure) or env var export. |
-| `mise` available | **mise** | Token stored in `mise.local.toml` (gitignored by convention). mise injects it into the environment automatically. |
-| `secret-tool` available | **Linux keyring** | Token stored in the system keyring via `secret-tool`. Retrieved at shell startup. |
-| `security` available | **macOS Keychain** | Token stored in macOS Keychain via `security`. Retrieved at shell startup. |
-| Always | **.env file** | Token written to `.env` using a silent terminal read — never echoed. Simple and portable. |
+| Tool | Label | Description |
+|------|-------|-------------|
+| `op` | **1Password** | Token stored in vault; never touches disk. |
+| `mise` | **mise** | Stored in `mise.local.toml` (gitignored); injected automatically. |
+| `secret-tool` | **Linux keyring** | Stored in system keyring. |
+| `security` | **macOS Keychain** | Stored in macOS Keychain. |
+| always | **.env file** | Written via silent terminal read; never echoed to chat. |
 
-#### 4e. If user chooses **1Password**
+Once the user picks, look up how to use that tool (`<tool> --help`, `man <tool>`, or context7) and guide them through:
+1. Storing the token (out-of-band — the user runs the command in their terminal, not via chat)
+2. Exposing it as `TG_BOT_TOKEN` in the environment
 
-Ask a follow-up (AskUserQuestion with 2 options):
-- **op run wrapper** — .mcp.json wraps the command with `op run`; token only exists for the subprocess lifetime. More secure.
-- **Environment variable** — export `TG_BOT_TOKEN` from 1Password in your shell profile using `op run`. Simpler, token lives in shell env.
+**Key constraint**: the token must never appear in the Claude Code chat. Use `read -rs` or equivalent silent-input patterns. Remind the user they can run terminal commands with `! <command>` in Claude Code to keep output local.
 
-For **op run wrapper**: tell the user to store the token in 1Password (if not already there) and note the vault/item/field path. Then in step 6, use this .mcp.json entry instead of the default:
+**1Password special case**: offer a sub-choice between the `op run` wrapper (token injected at subprocess launch, never in shell env — requires a different .mcp.json entry, see step 6) vs exporting via `op read` in their shell profile.
 
-```json
-{
-  "mcpServers": {
-    "<slug>-tg": {
-      "command": "op",
-      "args": ["run", "--", "uv", "run", "--directory", "<abs-path>", "tg-local-mcp"],
-      "env": {
-        "TG_BOT_TOKEN": "op://<vault>/<item>/<field>"
-      }
-    }
-  }
-}
-```
+#### 4e. Verify the token is accessible
 
-For **environment variable**: instruct the user to add to their shell profile (e.g. `~/.zshrc` or `mise.local.toml`):
-```sh
-export TG_BOT_TOKEN=$(op read "op://<vault>/<item>/<field>")
-```
-
-#### 4f. If user chooses **mise**
-
-Tell the user to run this in their terminal (use `! <command>` in Claude Code to avoid the token appearing in chat):
-
-```
-Tell the user: "Run this in your terminal — the token will be written directly to mise.local.toml without appearing in chat:
-! read -rs TG_BOT_TOKEN && printf '\n[env]\nTG_BOT_TOKEN = \"%s\"\n' \"$TG_BOT_TOKEN\" >> mise.local.toml && echo 'Written.'"
-```
-
-If `mise.local.toml` doesn't exist, create it first with just `[env]` and have the user append to it.
-Add `mise.local.toml` to `.gitignore` if not already present.
-
-#### 4g. If user chooses **Linux keyring** (`secret-tool`)
-
-Tell the user to run in their terminal:
-```
-! read -rs TG_BOT_TOKEN && secret-tool store --label="TG bot: <slug>" service telegram-bot account <slug> <<< "$TG_BOT_TOKEN" && echo 'Stored.'
-```
-
-Then add to their shell profile to export it:
-```sh
-export TG_BOT_TOKEN=$(secret-tool lookup service telegram-bot account <slug>)
-```
-
-#### 4h. If user chooses **macOS Keychain** (`security`)
-
-Tell the user to run in their terminal:
-```
-! read -rs TG_BOT_TOKEN && security add-generic-password -s "tg-<slug>" -a "telegram-bot" -w "$TG_BOT_TOKEN" && echo 'Stored.'
-```
-
-Then add to their shell profile to export it:
-```sh
-export TG_BOT_TOKEN=$(security find-generic-password -s "tg-<slug>" -a "telegram-bot" -w)
-```
-
-#### 4i. If user chooses **.env file**
-
-Tell the user to run this in their terminal (the token is read silently and written directly to `.env`):
-```
-Tell the user: "Run this in your terminal:
-! read -rs TG_BOT_TOKEN && printf '# tg-local-client — bot token for <slug> (@<username>)\nTG_BOT_TOKEN=%s\n' \"$TG_BOT_TOKEN\" >> .env && echo 'Written.'"
-```
-
-Add `.env` to `.gitignore` if not already present.
-
-#### 4j. Verify the token is accessible
-
-After the user completes their chosen method, verify the token is reachable without reading its value:
+After setup, verify without revealing the value:
 
 ```bash
-# Should print the token length (not the token itself)
-echo ${#TG_BOT_TOKEN} 
+echo "token length: ${#TG_BOT_TOKEN}"
 ```
 
-If the length is 0, the env var isn't set — ask the user to open a fresh shell or source their profile.
-
-For the getUpdates discovery in step 5, read the token from the environment:
-```bash
-TOKEN="$TG_BOT_TOKEN"
-```
+If 0, the env var isn't set — ask the user to open a fresh shell or source their profile.
 
 ### 5. Discover group chat ID
 
