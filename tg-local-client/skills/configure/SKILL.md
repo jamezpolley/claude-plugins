@@ -30,6 +30,8 @@ If you don't have these, collect them as follows:
 
 **Username and token:** Ask for these as plain text in a single follow-up message — do NOT use AskUserQuestion for these (no meaningful options to suggest, and the tool requires ≥2 options per question).
 
+If the user doesn't have a bot yet, point them to https://core.telegram.org/bots#botfather — the official guide covers creating a bot and obtaining the token in a few steps.
+
 ## Steps
 
 ### 1. Check for existing install
