@@ -31,11 +31,14 @@ Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `m
 
 ## Session startup (required on every session start)
 
-1. **Start the monitor:**
+1. **Start the monitor** — call `get_tail_command` then pass the returned command string **directly to the `Monitor` tool** (`persistent=True`). Do NOT use `Bash(run_in_background=True)`, `tail -f`, or shell pipes — Monitor is the correct tool.
+
+   ```python
+   result = get_tail_command(triage={"role": "<slug>", "state_file": "~/.local/share/tg-local/<slug>/waiting-on.md", "model": "claude-sonnet-4-6"})
+   Monitor(command=result["command"], description="<slug>-tg inbound monitor", persistent=True)
    ```
-   get_tail_command(wake_on=["mention", "trusted_humans"], triage={...})
-   ```
-   Pass the result directly to `Bash(run_in_background=True)`. Do NOT use `tail -f` or shell pipes.
+
+   If a monitor from a previous session is still running (check with `ps aux | grep tg-local-tail`), kill the old process before starting a new one to avoid duplicate consumers on the same cursor file.
 
 2. **Catch-up read:**
    ```
