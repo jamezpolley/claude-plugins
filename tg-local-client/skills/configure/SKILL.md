@@ -73,6 +73,8 @@ Write `.claude/tg-local-client/config.local.json` with the values collected so f
 
 This means: do not ask for the token, do not have the user paste it, do not echo it back, do not include it in any message. If you are ever unsure whether a step would expose the token, choose the option that doesn't.
 
+**`!` commands are NOT safe for token-containing commands.** When a user runs `! <command>` in Claude Code, the command string appears in the chat transcript. Never suggest `! curl https://api.telegram.org/bot<TOKEN>/...` or any command with the token inline — the token ends up in the transcript. If a curl/API call involving the token is needed for debugging, tell the user to run it in a separate terminal outside of Claude Code.
+
 #### 4a. Check if a token is already configured
 
 First check if `TG_BOT_TOKEN` is already set in the environment or in an existing `.env` / `mise.local.toml`:
@@ -145,7 +147,23 @@ If 0, the env var isn't set — ask the user to open a fresh shell or source the
 
 ### 5. Discover group chat ID
 
-Ask the user to make sure the bot has been added to their coordination group and that at least one message has been sent there (so the bot has seen the chat). Then run:
+#### 5a. Verify the token with getMe
+
+Before querying for updates, call `getMe` to confirm the token is valid and check privacy mode:
+
+```bash
+curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN}/getMe"
+```
+
+Check the response:
+- `username` should match the configured bot username — if not, the token is for the wrong bot
+- `can_read_all_group_messages: false` means privacy mode is on — the bot only sees messages that @mention it directly. Tell the user to send `@<botusername> hello` in the group rather than any plain message.
+
+Do not suggest running any command with the token embedded as a literal value in the chat — `${TG_BOT_TOKEN}` is safe because it resolves in the shell.
+
+#### 5b. Query for updates
+
+Ask the user to make sure the bot has been added to their group and a message has been sent (or `@<botusername> hello` if privacy mode is on). Then run:
 
 ```bash
 curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN}/getUpdates" | python3 -c "
@@ -165,9 +183,12 @@ for cid, chat in sorted(chats.items()):
 
 - If **one group** is found: use its ID, tell the user, and update `group_chat_ids` in `config.local.json`.
 - If **multiple groups** are found: use AskUserQuestion to present them (label = title, description = chat ID + type) so the user can pick. Then update `group_chat_ids`.
-- If **no groups** are found: tell the user the bot hasn't seen any group messages yet. Ask them to send a message in the group (or add the bot if they haven't), then re-run this step.
+- If **no groups** are found, check:
+  - **Webhook set?** Run `curl -s "https://api.telegram.org/bot${TG_BOT_TOKEN}/getWebhookInfo"` — if a webhook URL is present, another client is consuming updates. Suggest rotating the token via BotFather to cut off existing connections.
+  - **Another long-polling client?** Same symptom — rotating the token is the fix.
+  - **Forum supergroup?** (`has_topics_enabled: true` in group info) — messages in topic threads may not appear in getUpdates. Fall back to asking the user to find the chat ID from the Telegram Web URL (`web.telegram.org` → open group → copy ID from URL).
 
-After updating `config.local.json` with the discovered chat ID, continue to step 6.
+After updating `config.local.json` with the discovered chat ID(s), continue to step 6.
 
 ### 6. Register MCP server in .mcp.json
 
