@@ -101,6 +101,8 @@ Wait for them to do this, then re-check step 4a before continuing. If they prefe
 
 ```bash
 echo "op:$(which op 2>/dev/null && echo yes || echo no)"
+echo "op-env-supported:$(op environment read --help >/dev/null 2>&1 && echo yes || echo no)"
+echo "op-service-account:$([ -n \"$OP_SERVICE_ACCOUNT_TOKEN\" ] && echo yes || echo no)"
 echo "mise:$(which mise 2>/dev/null && echo yes || echo no)"
 echo "secret-tool:$(which secret-tool 2>/dev/null && echo yes || echo no)"
 echo "security:$(which security 2>/dev/null && echo yes || echo no)"
@@ -112,13 +114,14 @@ Use AskUserQuestion to ask how they want to store the token. Only offer options 
 
 **Available options** (show only if detected):
 
-| Tool | Label | Description |
-|------|-------|-------------|
-| `op` | **1Password** | Token stored in vault; never touches disk. |
-| `mise` | **mise** | Stored in `mise.local.toml` (gitignored); injected automatically. |
-| `secret-tool` | **Linux keyring** | Stored in system keyring. |
-| `security` | **macOS Keychain** | Stored in macOS Keychain. |
-| always | **.env file** | Written via silent terminal read; never echoed to chat. |
+| Tool | Condition | Label | Description |
+|------|-----------|-------|-------------|
+| `op` + `op environment` supported + `OP_SERVICE_ACCOUNT_TOKEN` set | all three | **1Password Environment** | Token lives in a 1Password Environment; injected via `op run --environment`. Requires op CLI beta + service account. No env block needed in .mcp.json. |
+| `op` available | `op` only | **1Password vault** | Token stored in a vault item; injected via `op run`. Works with desktop app or service account. |
+| `mise` | `mise` found | **mise** | Stored in `mise.local.toml` or `.mise.local.toml` (gitignored); injected automatically. |
+| `secret-tool` | found | **Linux keyring** | Stored in system keyring. |
+| `security` | found | **macOS Keychain** | Stored in macOS Keychain. |
+| always | — | **.env file** | Written via silent terminal read; never echoed to chat. |
 
 Once the user picks, look up how to use that tool (`<tool> --help`, `man <tool>`, or context7) and guide them through:
 1. Storing the token (out-of-band — the user runs the command in their terminal, not via chat)
@@ -126,7 +129,9 @@ Once the user picks, look up how to use that tool (`<tool> --help`, `man <tool>`
 
 **Key constraint**: the token must never appear in the Claude Code chat. Use `read -rs` or equivalent silent-input patterns. Remind the user they can run terminal commands with `! <command>` in Claude Code to keep output local.
 
-**1Password special case**: offer a sub-choice between the `op run` wrapper (token injected at subprocess launch, never in shell env — requires a different .mcp.json entry, see step 6) vs exporting via `op read` in their shell profile.
+**1Password Environment special case** (requires op CLI beta + `OP_SERVICE_ACCOUNT_TOKEN`): no `env` block in .mcp.json — instead wrap the command with `op run --environment <environmentID>`. See step 6. Docs: https://www.1password.dev/environments/read-environment-variables#cli
+
+**1Password vault special case**: offer a sub-choice between the `op run` wrapper (token injected at subprocess launch, never in shell env — requires a different .mcp.json entry, see step 6) vs exporting via `op read` in their shell profile.
 
 #### 4e. Verify the token is accessible
 
@@ -184,7 +189,25 @@ Create or update `.mcp.json` in the project root. Merge — preserve any existin
 }
 ```
 
-**1Password op run wrapper entry** (if user chose that option in step 4c):
+**1Password Environment entry** (requires op CLI beta + `OP_SERVICE_ACCOUNT_TOKEN` in the environment — set it in `mise.local.toml` or `.mise.local.toml` and mise will inject it automatically):
+
+```json
+{
+  "mcpServers": {
+    "<slug>-tg": {
+      "command": "op",
+      "args": ["run", "--environment", "<environmentID>", "--", "uv", "run", "--directory", "<abs-path>", "tg-local-mcp"],
+      "env": {
+        "OP_SERVICE_ACCOUNT_TOKEN": "${OP_SERVICE_ACCOUNT_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+`op run --environment` reads the 1Password Environment and injects its variables into the subprocess directly — no separate `op environment read` step needed.
+
+**1Password vault op run wrapper entry**:
 
 ```json
 {
