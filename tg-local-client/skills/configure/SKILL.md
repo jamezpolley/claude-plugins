@@ -20,14 +20,15 @@ Set up a per-project Telegram bot client for agent communication.
 Before running, have ready:
 - Bot slug (short identifier, e.g. `pod` or `chez`) — drives the data dir and MCP name
 - Bot's Telegram @username (without the `@`)
-- Chat ID of the coordination group the bot has been added to
 - Bot token (from BotFather — stays gitignored, never committed)
+
+**Do NOT ask for the group chat ID** — it will be discovered automatically from the bot's recent updates after the token is available (see step 5).
 
 If you don't have these, collect them as follows:
 
 **Slug:** Use AskUserQuestion — suggest 2-3 options derived from the project name (e.g. for `pod-upload-app` suggest `pod`, `upload`, `pod-upload`), plus the user can select "Other" to type their own. AskUserQuestion requires at least 2 options; derive them from the project name/directory.
 
-**Username, chat ID, token:** Ask for these as plain text in a single follow-up message — do NOT use AskUserQuestion for these (no meaningful options to suggest, and the tool requires ≥2 options per question).
+**Username and token:** Ask for these as plain text in a single follow-up message — do NOT use AskUserQuestion for these (no meaningful options to suggest, and the tool requires ≥2 options per question).
 
 ## Steps
 
@@ -48,14 +49,14 @@ Add to `.gitignore` (append, don't overwrite):
 
 ### 3. Write config.local.json
 
-Write `.claude/tg-local-client/config.local.json` with the values provided:
+Write `.claude/tg-local-client/config.local.json` with the values provided. Leave `group_chat_ids` empty for now — it will be populated in step 5 after discovery:
 
 ```json
 {
   "bot_slug": "<slug>",
   "bot_username": "<username>",
   "mcp_name": "",
-  "group_chat_ids": [<chat_id>],
+  "group_chat_ids": [],
   "token_env_var": "TG_BOT_TOKEN"
 }
 ```
@@ -76,7 +77,35 @@ TG_BOT_TOKEN=<token>
 
 Add `.env` to `.gitignore` if not already present. If `.env` is already gitignored (e.g. via `*.env` or a devcontainer pattern), note that and skip.
 
-### 5. Register MCP server in .mcp.json
+### 5. Discover group chat ID
+
+Ask the user to make sure the bot has been added to their coordination group and that at least one message has been sent there (so the bot has seen the chat). Then run:
+
+```bash
+TOKEN=$(grep TG_BOT_TOKEN .env | cut -d= -f2)
+curl -s "https://api.telegram.org/bot${TOKEN}/getUpdates" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+chats = {}
+for update in data.get('result', []):
+    for key in ['message', 'channel_post', 'my_chat_member', 'chat_member']:
+        if key in update:
+            chat = update[key].get('chat', {})
+            if chat and chat.get('type') in ('group', 'supergroup', 'channel'):
+                chats[chat['id']] = chat
+for cid, chat in sorted(chats.items()):
+    print(f'{cid}: {chat.get(\"title\", \"?\")} ({chat[\"type\"]})')
+"
+```
+
+- If **one group** is found: use its ID, tell the user, and update `group_chat_ids` in `config.local.json`.
+- If **multiple groups** are found: use AskUserQuestion to present them (label = title, description = chat ID + type) so the user can pick. Then update `group_chat_ids`.
+- If **no groups** are found: tell the user the bot hasn't seen any group messages yet. Ask them to send a message in the group (or add the bot if they haven't), then re-run this step.
+
+After updating `config.local.json` with the discovered chat ID, continue to step 6.
+
+### 6. Register MCP server in .mcp.json
+
 
 Create or update `.mcp.json` in the project root. Merge — preserve any existing entries.
 
@@ -96,11 +125,11 @@ The entry to add (replace `<abs-path>` with the absolute path to `.claude/tg-loc
 }
 ```
 
-### 6. Allow MCP tools in .claude/settings.json
+### 7. Allow MCP tools in .claude/settings.json
 
 Add `"mcp__<slug>-tg__*"` to `permissions.allow` in `.claude/settings.json`. Merge with existing permissions.
 
-### 7. Summary
+### 8. Summary
 
 Tell the user:
 - MCP server name: `<slug>-tg`
