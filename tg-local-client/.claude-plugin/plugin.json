@@ -1,6 +1,6 @@
 {
   "name": "tg-local-client",
-  "version": "2.0.5",
+  "version": "2.0.6",
   "description": "Per-project Telegram bot client for agent communication. Bundles the MCP server — no git clone needed. Configure skill handles fresh installs and migration from v1.x. MCP name is fixed: tg-bot-client.",
   "author": {
     "name": "James Polley",

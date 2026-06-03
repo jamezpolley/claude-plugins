@@ -19,30 +19,18 @@ Set up a per-project Telegram bot client for agent communication.
 
 ### 1. Detect install type
 
-Check for an existing config file:
+Check for existing config files to determine the install state:
 
 ```bash
-cat .claude/tg-local-client/config.local.json 2>/dev/null
+cat .claude/tg-bot-client/config.local.json 2>/dev/null && echo "---NEW---" || true
+cat .claude/tg-local-client/config.local.json 2>/dev/null && echo "---OLD---" || true
 ```
 
-- **Found** → **migration mode**: read `bot_slug`, `bot_username`, and `group_chat_ids` from it. Skip steps 2 and 5 (use existing values).
-- **Not found** → **fresh install**: proceed through all steps.
+- **`tg-bot-client` config found** → **re-run/recovery mode**: config already written from a prior configure run. Use the existing `bot_slug`, `bot_username`, and `group_chat_ids`. Skip steps 2, 3, and 5. Proceed to step 4 (verify token) and step 6 (fix `.mcp.json` if needed).
+- **`tg-local-client` config found** → **migration mode**: read values from it. Skip steps 2 and 5.
+- **Neither found** → **fresh install**: proceed through all steps.
 
-Also note any stale `.mcp.json` entries to clean up in step 6:
-
-```bash
-python3 -c "
-import json, sys
-try:
-    d = json.load(open('.mcp.json'))
-    for k in d.get('mcpServers', {}):
-        if k != 'tg-bot-client':
-            print(k)
-except: pass
-"
-```
-
-Any entry printed here is stale and will be removed in step 6.
+Also check `.mcp.json` directly — read it with the Read tool and note any `mcpServers` keys that are not `tg-bot-client`. Those are stale and will be removed in step 6. Also check whether the `tg-bot-client` entry (if present) contains the literal string `CLAUDE_PLUGIN_ROOT` — if so, it is broken and must be rewritten in step 6.
 
 ### 2. Collect prerequisites (fresh install only — skip if migration)
 
@@ -87,11 +75,10 @@ Do not ask for the token, do not have the user paste it, do not echo it back, do
 #### 4a. Check if a token is already configured
 
 ```bash
-echo "env:${#TG_BOT_TOKEN}"
-grep -sl TG_BOT_TOKEN .env mise.local.toml .mise.local.toml 2>/dev/null
+echo "token length: ${#TG_BOT_TOKEN}"
 ```
 
-`-l` lists matching filenames only — never show file contents (the token value must not appear in the transcript). If the env var length is non-zero, skip to step 5.
+If the length is non-zero, the token is available in the environment — skip to step 5. Do not run grep or any command that could print file contents containing the token.
 
 #### 4b. Check for an .env.sample or .env.example
 
@@ -187,7 +174,7 @@ Create or update `.mcp.json` in the project root. Remove any stale entries ident
 >
 > This means:
 > - **`${TG_BOT_TOKEN}`** — write exactly as shown; Claude Code expands it from the shell environment at launch.
-> - **`--directory` path** — the skill renderer has already expanded `CLAUDE_PLUGIN_ROOT` to the correct absolute path. The path shown in the templates below **is what you must write** into `.mcp.json`. Do not replace it with `${CLAUDE_PLUGIN_ROOT}` — that literal string will not be resolved and the MCP will fail to start.
+> - **`--directory` path** — the skill renderer has already expanded `CLAUDE_PLUGIN_ROOT` to the correct absolute path. The path shown in the templates below **is what you must write** into `.mcp.json`. Do not substitute the variable form DOLLAR{CLAUDE_PLUGIN_ROOT} — that will not be resolved in a project-scoped `.mcp.json` and the MCP will fail to start.
 > - **`TG_CONFIG_DIR`** — similarly pre-expanded. Run `realpath .` in the project root to confirm the project path if needed, then write it as an absolute path.
 >
 > **After a plugin update** the plugin cache path changes (the version number in the path changes). You must re-run `/tg-local-client:configure` after each plugin update to refresh the hardcoded path in `.mcp.json`.
