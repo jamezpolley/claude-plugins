@@ -50,6 +50,12 @@ The MCP server name is `tg-bot-client`. Tools are prefixed `mcp__tg-bot-client__
    ```
    Read what arrived while the monitor was down.
 
+3. **Optional sanity checks** (recommended on first boot or after a plugin upgrade):
+   - `get_me` — confirm bot identity and whether privacy mode is on (`can_read_all_group_messages: false` means the bot only sees @mentions)
+   - `list_known_chats` — confirm which groups the bot is in and their recent activity
+   - `client_version` — confirm the running code version matches expectations
+   - Check your copy of the fleet comms guide: `docs/fabric-comms-conventions.md` — current version is `2026-05-31.3`. If Dex has re-shared a newer version in the coord group, re-download it.
+
 ## Key behaviours
 
 ### Acknowledge on Telegram FIRST — before any other work
