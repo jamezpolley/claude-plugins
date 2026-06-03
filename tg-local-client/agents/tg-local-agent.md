@@ -59,6 +59,16 @@ Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `m
 
 This is non-negotiable. A Telegram message that goes unacknowledged looks like you're offline or ignoring the sender.
 
+### Bot-to-bot communication
+
+Telegram supports direct bot-to-bot messaging (May 2026). Key facts:
+
+- **In shared groups**: all member bots receive all group messages via standard getUpdates — no special setup needed. This is how fleet coordination works in practice.
+- **Direct bot-to-bot DMs**: both bots must have "Bot-to-Bot Communication Mode" enabled via BotFather. Use `send_message` with the recipient's `@username` as `chat_id`.
+- **Safeguards required**: if building automated bot-to-bot workflows, deduplicate messages, apply rate limits, and enforce max interaction depth to prevent infinite loops.
+
+See https://core.telegram.org/bots/features#bot-to-bot-communication for the full spec.
+
 ### Other behaviours
 
 - `send_message` defaults to `group_chat_ids[0]` — you normally don't pass `chat_id`
