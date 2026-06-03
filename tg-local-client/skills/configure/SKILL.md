@@ -181,15 +181,27 @@ for cid, chat in sorted(chats.items()):
 
 Create or update `.mcp.json` in the project root. Remove any stale entries identified in step 1. Add the `tg-bot-client` entry.
 
-**Note for the agent reading this skill — variable expansion warning:**
+**Note for the agent reading this skill — how paths work in `.mcp.json`:**
 
-> The skill renderer expands variables before this text reaches you. The templates below contain hardcoded absolute paths — but you must NOT write those paths into `.mcp.json`. Claude Code resolves the same variables at MCP launch time, so writing the variable form keeps the path correct across plugin updates and machine migrations.
+> Project-scoped `.mcp.json` files only expand **shell environment variables** (e.g. `${TG_BOT_TOKEN}`, `${HOME}`). The plugin-system variables `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PROJECT_DIR` are **not** shell env vars — they are only resolved inside plugin-provided configs, not in project `.mcp.json`.
 >
-> The two variables to write literally in `.mcp.json`:
-> - `--directory` arg: `DOLLAR{CLAUDE_PLUGIN_ROOT}/mcp-src` (i.e. replace `DOLLAR` with `$`) — which on this machine expands to `${CLAUDE_PLUGIN_ROOT}/mcp-src`
-> - `TG_CONFIG_DIR`: `DOLLAR{CLAUDE_PROJECT_DIR}/.claude/tg-bot-client` — which on this machine expands to `${CLAUDE_PROJECT_DIR}/.claude/tg-bot-client`
+> This means:
+> - **`${TG_BOT_TOKEN}`** — write exactly as shown; Claude Code expands it from the shell environment at launch.
+> - **`--directory` path** — the skill renderer has already expanded `CLAUDE_PLUGIN_ROOT` to the correct absolute path. The path shown in the templates below **is what you must write** into `.mcp.json`. Do not replace it with `${CLAUDE_PLUGIN_ROOT}` — that literal string will not be resolved and the MCP will fail to start.
+> - **`TG_CONFIG_DIR`** — similarly pre-expanded. Run `realpath .` in the project root to confirm the project path if needed, then write it as an absolute path.
 >
-> In the templates below, wherever you see those expanded paths, write the `DOLLAR{...}` form instead.
+> **After a plugin update** the plugin cache path changes (the version number in the path changes). You must re-run `/tg-local-client:configure` after each plugin update to refresh the hardcoded path in `.mcp.json`.
+>
+> **Recovery — if your MCP is not loading:** check whether `.mcp.json` contains the literal string `CLAUDE_PLUGIN_ROOT`. If it does, a previous configure run wrote the variable name instead of the resolved path. Re-run this skill to fix it.
+> ```bash
+> grep CLAUDE_PLUGIN_ROOT .mcp.json
+> ```
+
+Before writing, get the project directory:
+
+```bash
+realpath .
+```
 
 **Default entry** (all token storage methods except 1Password op run):
 

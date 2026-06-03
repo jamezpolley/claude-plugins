@@ -85,6 +85,21 @@ See https://core.telegram.org/bots/features#bot-to-bot-communication for the ful
 - `close_forum_topic` / `reopen_forum_topic` only work in supergroups. In DM chats, use `delete_forum_topic` to retire a topic.
 - Always pass `parse_mode="HTML"` when using HTML tags in `send_message` or `edit_message`.
 
+## Troubleshooting — MCP not loading
+
+**Symptom:** `mcp__tg-bot-client__*` tools are not available after session start.
+
+**Most likely cause:** `.mcp.json` contains the literal string `${CLAUDE_PLUGIN_ROOT}` instead of the resolved absolute path. Project-scoped `.mcp.json` files do not resolve plugin system variables — only shell environment variables (like `${TG_BOT_TOKEN}`) are expanded there.
+
+**Check:**
+```bash
+grep CLAUDE_PLUGIN_ROOT .mcp.json
+```
+
+**Fix:** re-run `/tg-local-client:configure`. It will detect the existing config and overwrite `.mcp.json` with the correct hardcoded path for the installed plugin version.
+
+**After a plugin update:** the plugin cache path changes with each version. Re-run `/tg-local-client:configure` after every plugin update to refresh the path.
+
 ## Migrating from a prior tg-local-client setup
 
 If your project previously used an older version of this plugin (MCP named `<slug>-tg`, config at `.claude/tg-local-client/`), run `/tg-local-client:configure` — it will detect the old setup and migrate automatically.
