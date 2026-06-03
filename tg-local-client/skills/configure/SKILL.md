@@ -250,6 +250,15 @@ Replace `<abs-path>` with the absolute path to `.claude/tg-local-client/`.
 
 Add `"mcp__<slug>-tg__*"` to `permissions.allow` in `.claude/settings.json`. Merge with existing permissions.
 
+> **Scope warning:** The MCP server must be registered at **project scope only** (via `.mcp.json`). If the user previously ran `claude mcp add` without `--scope project`, it may also be registered at user scope. Check and remove any duplicate:
+> ```bash
+> claude mcp list
+> ```
+> If `<slug>-tg` appears in both project and user scope, remove the user-scoped one:
+> ```bash
+> claude mcp remove <slug>-tg -s user
+> ```
+
 ### 8. Summary
 
 Tell the user:

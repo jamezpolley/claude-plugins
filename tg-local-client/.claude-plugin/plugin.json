@@ -1,6 +1,6 @@
 {
   "name": "tg-local-client",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Per-project Telegram bot client for agent communication. Provides a configure skill to bootstrap a project-local tg-local-client clone, and an agent brief covering tools, startup, and migration from the dex-fabric client.",
   "author": {
     "name": "James Polley",

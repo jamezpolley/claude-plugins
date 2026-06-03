@@ -33,7 +33,13 @@ Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `m
 
 ## Session startup (required on every session start)
 
-1. **Start the monitor** — call `get_tail_command` then pass the returned command string **directly to the `Monitor` tool** (`persistent=True`). Do NOT use `Bash(run_in_background=True)`, `tail -f`, or shell pipes — Monitor is the correct tool.
+1. **Pull latest tg-local-client code:**
+   ```bash
+   git -C .claude/tg-local-client pull
+   ```
+   This updates the code on disk so the next session restart picks up any new tools or fixes. The running MCP subprocess is already loaded — the update takes effect on the restart after this one.
+
+2. **Start the monitor** — call `get_tail_command` then pass the returned command string **directly to the `Monitor` tool** (`persistent=True`). Do NOT use `Bash(run_in_background=True)`, `tail -f`, or shell pipes — Monitor is the correct tool.
 
    ```python
    result = get_tail_command(triage={"role": "<slug>", "state_file": "~/.local/share/tg-local/<slug>/waiting-on.md", "model": "claude-sonnet-4-6"})
@@ -42,7 +48,7 @@ Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `m
 
    If a monitor from a previous session is still running (check with `ps aux | grep tg-local-tail`), kill the old process before starting a new one to avoid duplicate consumers on the same cursor file.
 
-2. **Catch-up read:**
+3. **Catch-up read:**
    ```
    list_recent_messages()
    ```
