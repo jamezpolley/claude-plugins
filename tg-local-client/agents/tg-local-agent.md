@@ -11,7 +11,7 @@ Your project has a per-project Telegram bot configured via tg-local-client. This
 
 ## Your MCP tools
 
-Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `mcp__<slug>-tg__*`. The 24 tools are:
+The MCP server name is `tg-bot-client`. Tools are prefixed `mcp__tg-bot-client__*`. The 25 tools are:
 
 **Sending:** `send_message`, `stream_message_draft` (send-or-edit; first call sends, subsequent calls with `message_id` edit in place), `send_photo`, `send_document`
 
@@ -27,28 +27,24 @@ Your bot slug determines the MCP server name: `<slug>-tg`. Tools are prefixed `m
 
 **Identity:** `trust_identity`, `untrust_identity`, `lookup_identity`, `list_trusted_identities`
 
+**Bot info:** `get_me` — returns bot's Telegram profile. Key field: `can_read_all_group_messages` (false = privacy mode on; bot only sees @mentions). Call as `mcp__tg-bot-client__get_me()`.
+
 **Monitor:** `get_tail_command` — returns a flat `uv run … tg-local-tail …` command for live monitoring
 
 **Meta:** `client_version`
 
 ## Session startup (required on every session start)
 
-1. **Pull latest tg-local-client code:**
-   ```bash
-   git -C .claude/tg-local-client pull
-   ```
-   This updates the code on disk so the next session restart picks up any new tools or fixes. The running MCP subprocess is already loaded — the update takes effect on the restart after this one.
-
-2. **Start the monitor** — call `get_tail_command` then pass the returned command string **directly to the `Monitor` tool** (`persistent=True`). Do NOT use `Bash(run_in_background=True)`, `tail -f`, or shell pipes — Monitor is the correct tool.
+1. **Start the monitor** — call `get_tail_command` then pass the returned command string **directly to the `Monitor` tool** (`persistent=True`). Do NOT use `Bash(run_in_background=True)`, `tail -f`, or shell pipes — Monitor is the correct tool.
 
    ```python
-   result = get_tail_command(triage={"role": "<slug>", "state_file": "~/.local/share/tg-local/<slug>/waiting-on.md", "model": "claude-sonnet-4-6"})
-   Monitor(command=result["command"], description="<slug>-tg inbound monitor", persistent=True)
+   result = get_tail_command(triage={"role": "<your-role>", "state_file": "~/.local/share/tg-local/<slug>/waiting-on.md", "model": "claude-sonnet-4-6"})
+   Monitor(command=result["command"], description="tg-bot-client inbound monitor", persistent=True)
    ```
 
    If a monitor from a previous session is still running (check with `ps aux | grep tg-local-tail`), kill the old process before starting a new one to avoid duplicate consumers on the same cursor file.
 
-3. **Catch-up read:**
+2. **Catch-up read:**
    ```
    list_recent_messages()
    ```
@@ -81,34 +77,29 @@ See https://core.telegram.org/bots/features#bot-to-bot-communication for the ful
 - **Reactions reach humans but NOT other bots.** Use text replies for anything another agent must see.
 - `start_typing` (self-refreshing) for operations longer than ~5s; `send_typing` for short one-shot bursts.
 - `close_forum_topic` / `reopen_forum_topic` only work in supergroups. In DM chats, use `delete_forum_topic` to retire a topic.
+- Always pass `parse_mode="HTML"` when using HTML tags in `send_message` or `edit_message`.
 
-## Migrating from the dex-fabric client (mcp__dex-tg__)
+## Migrating from a prior tg-local-client setup
 
-If your project previously used the dex-fabric client, here are the key differences:
+If your project previously used an older version of this plugin (MCP named `<slug>-tg`, config at `.claude/tg-local-client/`), run `/tg-local-client:configure` — it will detect the old setup and migrate automatically.
 
-### Tool name changes
+If your project previously used the dex-fabric client (`mcp__dex-tg__*`), see the tool name changes below.
 
-| Old (dex-tg) | New (slug-tg) | Notes |
+### Tool name changes from dex-tg
+
+| Old (dex-tg) | New (tg-bot-client) | Notes |
 |---|---|---|
-| `mcp__dex-tg__send_message` | `mcp__<slug>-tg__send_message` | Same signature |
-| `mcp__dex-tg__stream_message_draft` | `mcp__<slug>-tg__stream_message_draft` | Same signature |
-| `mcp__dex-tg__get_tail_command` | `mcp__<slug>-tg__get_tail_command` | Same signature |
-| `mcp__dex-tg__list_recent_messages` | `mcp__<slug>-tg__list_recent_messages` | Same signature |
+| `mcp__dex-tg__send_message` | `mcp__tg-bot-client__send_message` | Same signature |
+| `mcp__dex-tg__stream_message_draft` | `mcp__tg-bot-client__stream_message_draft` | Same signature |
+| `mcp__dex-tg__get_tail_command` | `mcp__tg-bot-client__get_tail_command` | Same signature |
+| `mcp__dex-tg__list_recent_messages` | `mcp__tg-bot-client__list_recent_messages` | Same signature |
 | `mcp__dex-tg__list_bots` | *(removed)* | Single-bot client — no `list_bots` |
 | any tool with `bot=` arg | same tool, no `bot=` arg | Single-bot: `bot=` is gone |
 
-### Structural differences
+### Structural differences from dex-tg
 
-- **No `bot=` argument** on any tool. The old fabric was multi-bot; this client handles exactly one bot. Remove any `bot=` kwarg from existing tool calls.
-- **No `list_bots`**. If your agent called `list_bots` to discover its own identity, use `client_version` instead (returns the running bot's registered tools), or read `config.local.json` directly.
-- **Channel file path changed.** Old fabric wrote to `~/.local/share/dex-tg/channels/<slug>.jsonl`. New client writes to `~/.local/share/tg-local/<slug>/channels/<slug>.jsonl`. Update any hardcoded paths.
-- **MCP registration is project-local** (via `.mcp.json`), not global. The bootstrap no longer writes to `~/.claude.json`.
-- **Trust identities** may need re-running. The trusted_identities DB is in `~/.local/share/tg-local/<slug>/messages.db` — it won't carry over from the old fabric automatically. Call `trust_identity` once per trusted human on the new client.
-
-### AGENTS.md / agent brief updates
-
-Replace any reference to:
-- `mcp__dex-tg__*` → `mcp__<slug>-tg__*`
-- `bot_slug` in the old fabric (e.g. `grocy410`) → same slug, new MCP prefix
-- `~/.local/share/dex-tg/` data dir → `~/.local/share/tg-local/<slug>/`
-- `bot=` args in tool calls → remove entirely
+- **No `bot=` argument** on any tool. Remove any `bot=` kwarg from existing tool calls.
+- **No `list_bots`**. Use `client_version` to confirm the running bot, or read `.claude/tg-bot-client/config.local.json` directly.
+- **Channel file path**: `~/.local/share/tg-local/<slug>/channels/<slug>.jsonl`
+- **MCP registration** is project-local via `.mcp.json` — not global.
+- **Trust identities** may need re-running on a new client. Call `trust_identity` once per trusted human.
