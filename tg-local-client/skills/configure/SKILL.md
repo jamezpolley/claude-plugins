@@ -259,7 +259,30 @@ Add `"mcp__<slug>-tg__*"` to `permissions.allow` in `.claude/settings.json`. Mer
 > claude mcp remove <slug>-tg -s user
 > ```
 
-### 8. Summary
+### 8. Add SessionStart hook to .claude/settings.json
+
+Add a `SessionStart` hook that automatically pulls the latest tg-local-client code and reminds the agent to start the Telegram monitor. Merge with any existing hooks in `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "git -C .claude/tg-local-client pull --quiet 2>&1 | grep -v 'Already up to date' || true; echo '[tg-local-client] Start your Telegram monitor now: call get_tail_command then pass the result directly to Monitor(persistent=True).'"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If `SessionStart` hooks already exist, append this entry to the existing array — do not replace it.
+
+### 9. Summary
 
 Tell the user:
 - MCP server name: `<slug>-tg`
