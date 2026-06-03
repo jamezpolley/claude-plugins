@@ -88,10 +88,10 @@ Do not ask for the token, do not have the user paste it, do not echo it back, do
 
 ```bash
 echo "env:${#TG_BOT_TOKEN}"
-grep -s TG_BOT_TOKEN .env mise.local.toml .mise.local.toml 2>/dev/null | head -3
+grep -sl TG_BOT_TOKEN .env mise.local.toml .mise.local.toml 2>/dev/null
 ```
 
-If the token is already present and non-empty, skip to step 5.
+`-l` lists matching filenames only — never show file contents (the token value must not appear in the transcript). If the env var length is non-zero, skip to step 5.
 
 #### 4b. Check for an .env.sample or .env.example
 
