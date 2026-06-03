@@ -181,9 +181,16 @@ for cid, chat in sorted(chats.items()):
 
 Create or update `.mcp.json` in the project root. Remove any stale entries identified in step 1. Add the `tg-bot-client` entry.
 
+**Critical — two runtime variables must appear as literal strings in `.mcp.json`:**
+
+- `--directory` value: write the **literal text** `${CLAUDE_PLUGIN_ROOT}/mcp-src` — dollar sign, curly braces, exactly as shown. Claude Code resolves this to the plugin directory at MCP launch time, so the path stays correct across plugin updates.
+- `TG_CONFIG_DIR` value: write the **literal text** `${CLAUDE_PROJECT_DIR}/.claude/tg-bot-client`. Claude Code resolves this to the project root at launch time.
+
+Do NOT substitute these with actual paths — they must remain as `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PROJECT_DIR}` in the file.
+
 **Default entry** (all token storage methods except 1Password op run):
 
-```json
+```
 {
   "mcpServers": {
     "tg-bot-client": {
@@ -200,7 +207,7 @@ Create or update `.mcp.json` in the project root. Remove any stale entries ident
 
 **1Password Environment entry**:
 
-```json
+```
 {
   "mcpServers": {
     "tg-bot-client": {
@@ -217,7 +224,7 @@ Create or update `.mcp.json` in the project root. Remove any stale entries ident
 
 **1Password vault op run wrapper entry**:
 
-```json
+```
 {
   "mcpServers": {
     "tg-bot-client": {
