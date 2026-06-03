@@ -181,12 +181,15 @@ for cid, chat in sorted(chats.items()):
 
 Create or update `.mcp.json` in the project root. Remove any stale entries identified in step 1. Add the `tg-bot-client` entry.
 
-**Critical — two runtime variables must appear as literal strings in `.mcp.json`:**
+**Note for the agent reading this skill — variable expansion warning:**
 
-- `--directory` value: write the **literal text** `${CLAUDE_PLUGIN_ROOT}/mcp-src` — dollar sign, curly braces, exactly as shown. Claude Code resolves this to the plugin directory at MCP launch time, so the path stays correct across plugin updates.
-- `TG_CONFIG_DIR` value: write the **literal text** `${CLAUDE_PROJECT_DIR}/.claude/tg-bot-client`. Claude Code resolves this to the project root at launch time.
-
-Do NOT substitute these with actual paths — they must remain as `${CLAUDE_PLUGIN_ROOT}` and `${CLAUDE_PROJECT_DIR}` in the file.
+> The skill renderer expands variables before this text reaches you. The templates below contain hardcoded absolute paths — but you must NOT write those paths into `.mcp.json`. Claude Code resolves the same variables at MCP launch time, so writing the variable form keeps the path correct across plugin updates and machine migrations.
+>
+> The two variables to write literally in `.mcp.json`:
+> - `--directory` arg: `DOLLAR{CLAUDE_PLUGIN_ROOT}/mcp-src` (i.e. replace `DOLLAR` with `$`) — which on this machine expands to `${CLAUDE_PLUGIN_ROOT}/mcp-src`
+> - `TG_CONFIG_DIR`: `DOLLAR{CLAUDE_PROJECT_DIR}/.claude/tg-bot-client` — which on this machine expands to `${CLAUDE_PROJECT_DIR}/.claude/tg-bot-client`
+>
+> In the templates below, wherever you see those expanded paths, write the `DOLLAR{...}` form instead.
 
 **Default entry** (all token storage methods except 1Password op run):
 
