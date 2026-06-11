@@ -376,17 +376,25 @@ TREND_WINDOWS = [
 ]
 
 
-def trend_series(cur, bucket: str, resets: str | None) -> list[tuple[str, float]]:
-    """Return [(label, pp_h), ...] for trend windows with sufficient data."""
+def trend_series(cur, bucket: str, resets: str | None, elapsed_h: float | None = None) -> list[tuple[str, float]]:
+    """Return [(label, pp_h), ...] for trend windows with sufficient data.
+
+    elapsed_h: hours since the effective reset epoch (override-aware).  Any
+    window longer than this would reach back into the previous quota cycle and
+    produce meaningless (often negative) rates, so those windows are skipped.
+    """
     result = []
     for label, win in TREND_WINDOWS:
+        win_hours = win.total_seconds() / 3600.0
+        # Skip windows that extend before the current quota cycle.
+        if elapsed_h is not None and win_hours > elapsed_h:
+            continue
         r = rate_for_bucket(cur, bucket, win, resets_at=resets)
         if r is None:
             continue
         pp_h, _first, _last, span_h, synthesized = r
         if synthesized:
             continue
-        win_hours = win.total_seconds() / 3600.0
         if span_h < win_hours * 0.8:
             continue
         result.append((label, pp_h))
@@ -528,7 +536,7 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
                       f"   ·  {headroom:.0f}% over {fmt_h(h_to_reset)}   [{verdict}]")
 
             # trend: load-average style
-            tr = fmt_trend(trend_series(cur, bucket, resets))
+            tr = fmt_trend(trend_series(cur, bucket, resets, elapsed_h=elapsed_h))
             if tr is not None:
                 print(f"  trend:     {tr}")
 
