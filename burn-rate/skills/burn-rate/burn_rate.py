@@ -366,6 +366,47 @@ def duty_cycle_eta(
     return pct_at_reset, None  # should not reach
 
 
+TREND_WINDOWS = [
+    ("1h",  timedelta(hours=1)),
+    ("2h",  timedelta(hours=2)),
+    ("6h",  timedelta(hours=6)),
+    ("1d",  timedelta(days=1)),
+    ("2d",  timedelta(days=2)),
+    ("5d",  timedelta(days=5)),
+]
+
+
+def trend_series(cur, bucket: str, resets: str | None) -> list[tuple[str, float]]:
+    """Return [(label, pp_h), ...] for trend windows with sufficient data."""
+    result = []
+    for label, win in TREND_WINDOWS:
+        r = rate_for_bucket(cur, bucket, win, resets_at=resets)
+        if r is None:
+            continue
+        pp_h, _first, _last, span_h, synthesized = r
+        if synthesized:
+            continue
+        win_hours = win.total_seconds() / 3600.0
+        if span_h < win_hours * 0.8:
+            continue
+        result.append((label, pp_h))
+    return result
+
+
+def fmt_trend(series: list[tuple[str, float]]) -> str | None:
+    """Format trend series as load-average style string, or None if empty."""
+    if not series:
+        return None
+    nums = " · ".join(f"{pp:.2f}" for _, pp in series)
+    labels = [lbl for lbl, _ in series]
+    # Compress legend: if all labels end in "h", strip h and join with /
+    if all(lbl.endswith("h") for lbl in labels):
+        legend = "/".join(lbl[:-1] for lbl in labels) + "h"
+    else:
+        legend = "/".join(labels)
+    return f"{nums}   pp/hr  ({legend})"
+
+
 def fmt_duty_line(
     pct_at_reset: float | None,
     exhaust_utc: datetime | None,
@@ -376,18 +417,18 @@ def fmt_duty_line(
     window_label = f"active {ACTIVE_START_HOUR:02d}:00–{ACTIVE_END_HOUR:02d}:00"
 
     if pct_at_reset is None:
-        return f"  duty:    insufficient data  [{window_label}]"
+        return f"  duty:      insufficient data  [{window_label}]"
 
     if exhaust_utc is not None:
         days_away = (exhaust_utc - now_utc).total_seconds() / 86400.0
         local_str = exhaust_utc.astimezone(_LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
         return (
-            f"  duty:    {pct_at_reset:.1f}% by reset  ·  "
+            f"  duty:      {pct_at_reset:.1f}% by reset  ·  "
             f"100% in ~{days_away:.1f}d (at {local_str})  [{window_label}]"
         )
     else:
         return (
-            f"  duty:    {pct_at_reset:.1f}% by reset  "
+            f"  duty:      {pct_at_reset:.1f}% by reset  "
             f"(no exhaustion at this rate)  [{window_label}]"
         )
 
@@ -399,7 +440,8 @@ def fmt_duty_line(
 def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
     now = datetime.now(timezone.utc)
 
-    print(f"Burn rate report ({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')}, rate window = {window})")
+    print(f"Burn rate report ({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
+    print("🕛 round-the-clock · 💼 duty hours")
     print()
 
     # Collapse seven_day + all_models_weekly into one logical bucket;
@@ -421,14 +463,14 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
         # Default: derived from resets_at - 7 days.
         # Override: if a manual override exists AND it is newer than derived,
         #           use it instead (and auto-expire it once derived catches up).
-        override_note = ""
+        override_active = False
+        effective_reset_ts = None
         if resets:
             effective_reset_ts, override_active = check_and_expire_override(
                 con, cur, bucket, resets
             )
             if override_active and effective_reset_ts is not None:
                 prev_reset_dt = parse_iso(effective_reset_ts)
-                override_note = f"  [override: reset epoch set to {effective_reset_ts}]"
             else:
                 prev_reset_dt = parse_iso(resets) - timedelta(days=7)
         else:
@@ -443,85 +485,70 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
                 primary_pp_h = pct / elapsed_h
                 primary = (primary_pp_h, elapsed_h)
 
-        # Comparison rate: recent --window snapshot, week-pace vs current pace.
-        recent = rate_for_bucket(cur, bucket, window, resets_at=resets)
-
         print(f"── {label} ──")
-        ts_local = parse_iso(ts).astimezone(_LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
-        print(f"  current: {pct:.1f}%  (snapshot {ts_local})")
+        ts_time = parse_iso(ts).astimezone(_LOCAL_TZ).strftime("%H:%M")
+        print(f"  current:   {pct:.1f}%   (snapshot {ts_time})")
         if resets:
             resets_local = parse_iso(resets).astimezone(_LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
-            print(f"  resets:  {resets_local}  ({fmt_h(h_to_reset)} from now)")
-        if override_note:
-            print(override_note)
+            override_tag = ""
+            if override_active and effective_reset_ts is not None:
+                override_tag = f"   [override epoch {effective_reset_ts}]"
+            print(f"  resets:    {resets_local}  ({fmt_h(h_to_reset)}){override_tag}")
 
         if primary is None:
-            print(f"  rate:    insufficient data (no reset timestamp)")
+            print(f"  so far:    insufficient data (no reset timestamp)")
         else:
             primary_pp_h, elapsed_h = primary
-            epoch_iso = prev_reset_dt.isoformat().replace("+00:00", "Z")
-            print(f"  rate:    {primary_pp_h:+.2f} pp/hr  "
-                  f"(since last reset: 0.0% → {pct:.1f}% over {elapsed_h:.1f}h"
-                  f"  [epoch: {epoch_iso}])")
 
-            # Recent comparison line — only show if it differs meaningfully
-            # from the since-reset rate, and only if we have real (not
-            # synthesized) recent data.
-            if recent is not None:
-                recent_pp_h, first_pct, last_pct, span_h, synthesized = recent
-                if not synthesized:
-                    delta = recent_pp_h - primary_pp_h
-                    arrow = "↑ hotter" if delta > 0.05 else ("↓ cooler" if delta < -0.05 else "≈ flat")
-                    print(f"  recent:  {recent_pp_h:+.2f} pp/hr  "
-                          f"(last {span_h:.1f}h: {first_pct:.1f}% → {last_pct:.1f}%)  "
-                          f"[{arrow} vs week avg]")
+            # so far: two bases — 🕛 24h and 💼 duty
+            active_elapsed = active_hours_between(prev_reset_dt, now)
+            sofar_duty = pct / active_elapsed if active_elapsed > 0 else float("nan")
+            print(f"  so far:    🕛 {primary_pp_h:.2f}   💼 {sofar_duty:.2f}   pp/hr"
+                  f"   ·  {pct:.0f}% over {elapsed_h:.1f}h")
 
-            # Sustainable daily budget: headroom spread evenly over the days
-            # left until reset. More honest than the raw ETA (which assumes the
-            # current pace holds forever) — it answers "how much can I spend per
-            # day and still coast to reset?" and compares it to the actual
-            # since-reset daily burn.
+            # remaining: headroom at two bases
             if h_to_reset == h_to_reset and h_to_reset > 0:
                 headroom = 100.0 - pct
-                days_to_reset = h_to_reset / 24.0
-                sustainable_per_day = headroom / days_to_reset if days_to_reset > 0 else float("inf")
-                # Actual since-reset burn expressed two ways:
-                #   24h   — rate held over a full calendar day (includes overnight)
-                #   duty  — rate held only over the active window (ACTIVE_HOURS_PER_DAY)
-                actual_per_day = primary_pp_h * 24.0            # 24h/day basis
-                actual_per_day_duty = primary_pp_h * ACTIVE_HOURS_PER_DAY  # duty-hours basis
-                if sustainable_per_day > 0:
-                    ratio = actual_per_day / sustainable_per_day
-                    if ratio > 1.15:
-                        verdict = f"⚠ over by {ratio:.1f}×"
-                    elif ratio < 0.85:
-                        verdict = f"✓ under ({ratio:.1f}×)"
-                    else:
-                        verdict = "≈ on budget"
+                rem_24h = headroom / h_to_reset
+                reset_utc_dt = parse_iso(resets)
+                active_remaining = active_hours_between(now, reset_utc_dt)
+                rem_duty = headroom / active_remaining if active_remaining > 0 else float("nan")
+
+                over_24h = primary_pp_h > rem_24h
+                over_duty = (sofar_duty == sofar_duty) and (rem_duty == rem_duty) and (sofar_duty > rem_duty)
+                if over_duty:
+                    verdict = "⚠ over even on 💼 — slow down"
+                elif over_24h:
+                    verdict = "⚠ over on 🕛, ok on 💼"
                 else:
-                    verdict = ""
-                print(f"  budget:  {sustainable_per_day:.1f} pp/d "
-                      f"({headroom:.0f}pp ÷ {days_to_reset:.1f}d)  ·  "
-                      f"actual ~{actual_per_day:.0f} pp/day / "
-                      f"~{actual_per_day_duty:.0f} pp/duty since reset  [{verdict}]")
+                    verdict = "✓ within budget"
+
+                rem_duty_str = f"{rem_duty:.2f}" if rem_duty == rem_duty else "—"
+                print(f"  remaining: 🕛 {rem_24h:.2f}   💼 {rem_duty_str}   pp/hr"
+                      f"   ·  {headroom:.0f}% over {fmt_h(h_to_reset)}   [{verdict}]")
+
+            # trend: load-average style
+            tr = fmt_trend(trend_series(cur, bucket, resets))
+            if tr is not None:
+                print(f"  trend:     {tr}")
 
             if primary_pp_h <= 0:
-                print(f"  ETA:     not increasing — no exhaustion projected")
+                print(f"  ETA:       not increasing — no exhaustion projected")
             else:
                 pp_remaining = 100.0 - pct
                 hrs_to_100 = pp_remaining / primary_pp_h
                 exhaust_at = now + timedelta(hours=hrs_to_100)
                 if resets and exhaust_at < parse_iso(resets):
                     margin_h = (parse_iso(resets) - exhaust_at).total_seconds() / 3600.0
-                    print(f"  ETA:     100% in {fmt_h(hrs_to_100)} "
+                    print(f"  ETA:       100% in {fmt_h(hrs_to_100)} "
                           f"(at {exhaust_at.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
                           f"⚠ BEFORE reset by {fmt_h(margin_h)}")
                 else:
                     pct_at_reset = pct + primary_pp_h * h_to_reset if h_to_reset == h_to_reset else None
                     if pct_at_reset is not None:
-                        print(f"  ETA:     {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
+                        print(f"  ETA:       {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
                     else:
-                        print(f"  ETA:     100% in {fmt_h(hrs_to_100)} (no reset known)")
+                        print(f"  ETA:       100% in {fmt_h(hrs_to_100)} (no reset known)")
 
             # ── Duty-cycle projection ──────────────────────────────────────
             # Same pp/hr rate, but burn only accrues during active hours
@@ -533,7 +560,7 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
                 )
                 print(fmt_duty_line(dc_pct_at_reset, dc_exhaust, now, reset_utc))
             else:
-                print(f"  duty:    no reset timestamp — cannot compute")
+                print(f"  duty:      no reset timestamp — cannot compute")
         print()
 
 
