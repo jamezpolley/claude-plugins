@@ -9,6 +9,18 @@
   ],
   "plugins": [
     {
+      "name": "burn-rate",
+      "source": "./burn-rate/",
+      "description": "Claude Code quota burn-rate reporting — % used, pp/hr, projected exhaustion of weekly buckets from ~/.claude/state/usage-log.sqlite",
+      "keywords": [
+        "quota",
+        "usage",
+        "burn-rate",
+        "claude-code",
+        "statusline"
+      ]
+    },
+    {
       "name": "session-sync",
       "source": "./session-sync/",
       "description": "End-of-session knowledge sync: summarise learnings, confirm with user, update CLAUDE.md and memory files, commit to git",
