@@ -485,7 +485,11 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
                 headroom = 100.0 - pct
                 days_to_reset = h_to_reset / 24.0
                 sustainable_per_day = headroom / days_to_reset if days_to_reset > 0 else float("inf")
-                actual_per_day = primary_pp_h * 24.0  # since-reset daily average
+                # Actual since-reset burn expressed two ways:
+                #   24h   — rate held over a full calendar day (includes overnight)
+                #   duty  — rate held only over the active window (ACTIVE_HOURS_PER_DAY)
+                actual_per_day = primary_pp_h * 24.0            # 24h/day basis
+                actual_per_day_duty = primary_pp_h * ACTIVE_HOURS_PER_DAY  # duty-hours basis
                 if sustainable_per_day > 0:
                     ratio = actual_per_day / sustainable_per_day
                     if ratio > 1.15:
@@ -496,9 +500,10 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
                         verdict = "≈ on budget"
                 else:
                     verdict = ""
-                print(f"  budget:  {sustainable_per_day:.1f} pp/day sustainable "
-                      f"({headroom:.0f}pp headroom ÷ {days_to_reset:.1f}d)  ·  "
-                      f"actual ~{actual_per_day:.0f} pp/day since reset  [{verdict}]")
+                print(f"  budget:  {sustainable_per_day:.1f} pp/d "
+                      f"({headroom:.0f}pp ÷ {days_to_reset:.1f}d)  ·  "
+                      f"actual ~{actual_per_day:.0f} pp/day / "
+                      f"~{actual_per_day_duty:.0f} pp/duty since reset  [{verdict}]")
 
             if primary_pp_h <= 0:
                 print(f"  ETA:     not increasing — no exhaustion projected")
