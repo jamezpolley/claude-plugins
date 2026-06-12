@@ -415,6 +415,22 @@ def fmt_trend(series: list[tuple[str, float]]) -> str | None:
     return f"{nums}   pp/hr  ({legend})"
 
 
+def snapshot_staleness_marker(snapshot_ts: str, threshold_min: int = 45) -> str | None:
+    """Return a staleness annotation string if `snapshot_ts` is older than
+    `threshold_min` minutes, or None if the snapshot is fresh.
+
+    Example return value:  '  ⚠ stale 1.2h'
+    """
+    try:
+        snap_dt = parse_iso(snapshot_ts)
+        age_h = (datetime.now(timezone.utc) - snap_dt).total_seconds() / 3600.0
+        if age_h >= threshold_min / 60.0:
+            return f"  ⚠ stale {age_h:.1f}h"
+        return None
+    except Exception:
+        return None
+
+
 def fmt_duty_line(
     pct_at_reset: float | None,
     exhaust_utc: datetime | None,
@@ -495,7 +511,8 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
 
         print(f"── {label} ──")
         ts_time = parse_iso(ts).astimezone(_LOCAL_TZ).strftime("%H:%M")
-        print(f"  current:   {pct:.1f}%   (snapshot {ts_time})")
+        stale_tag = snapshot_staleness_marker(ts) or ""
+        print(f"  current:   {pct:.1f}%   (snapshot {ts_time}){stale_tag}")
         if resets:
             resets_local = parse_iso(resets).astimezone(_LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
             override_tag = ""
