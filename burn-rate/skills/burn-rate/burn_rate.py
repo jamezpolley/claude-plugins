@@ -197,7 +197,8 @@ def latest_for_bucket(cur, bucket: str):
     return row
 
 
-def rate_for_bucket(cur, bucket: str, window: timedelta, resets_at: str | None = None):
+def rate_for_bucket(cur, bucket: str, window: timedelta, resets_at: str | None = None,
+                    cycle: timedelta = timedelta(days=7)):
     """Linear regression-ish: use first vs last snapshot in the window.
     Returns (pp_per_hour, first_pct, last_pct, span_hours, synthesized) or None.
 
@@ -239,7 +240,7 @@ def rate_for_bucket(cur, bucket: str, window: timedelta, resets_at: str | None =
             (bucket, resets_at),
         ).fetchone()
         if anchor is not None:
-            prev_reset_dt = parse_iso(resets_at) - timedelta(days=7)
+            prev_reset_dt = parse_iso(resets_at) - cycle
             prev_reset_iso = prev_reset_dt.isoformat().replace("+00:00", "Z")
             rows = [(prev_reset_iso, 0.0), anchor]
             synthesized = True
@@ -375,21 +376,39 @@ TREND_WINDOWS = [
     ("5d",  timedelta(days=5)),
 ]
 
+# Trend windows for the rolling 5h bucket — minute-to-hour scale.
+TREND_WINDOWS_5H = [
+    ("5m",  timedelta(minutes=5)),
+    ("15m", timedelta(minutes=15)),
+    ("30m", timedelta(minutes=30)),
+    ("1h",  timedelta(hours=1)),
+    ("2h",  timedelta(hours=2)),
+    ("4h",  timedelta(hours=4)),
+]
 
-def trend_series(cur, bucket: str, resets: str | None, elapsed_h: float | None = None) -> list[tuple[str, float]]:
+FIVE_HOUR_BUCKET = "five_hour"
+FIVE_HOUR_CYCLE = timedelta(hours=5)
+
+
+def trend_series(cur, bucket: str, resets: str | None, elapsed_h: float | None = None,
+                 windows: list | None = None, cycle: timedelta = timedelta(days=7)) -> list[tuple[str, float]]:
     """Return [(label, pp_h), ...] for trend windows with sufficient data.
 
     elapsed_h: hours since the effective reset epoch (override-aware).  Any
     window longer than this would reach back into the previous quota cycle and
     produce meaningless (often negative) rates, so those windows are skipped.
+
+    windows: the (label, timedelta) list to walk; defaults to the weekly
+    TREND_WINDOWS.  cycle: the quota-cycle length used by the synth fallback
+    (7d weekly, 5h for the five_hour bucket).
     """
     result = []
-    for label, win in TREND_WINDOWS:
+    for label, win in (windows or TREND_WINDOWS):
         win_hours = win.total_seconds() / 3600.0
         # Skip windows that extend before the current quota cycle.
         if elapsed_h is not None and win_hours > elapsed_h:
             continue
-        r = rate_for_bucket(cur, bucket, win, resets_at=resets)
+        r = rate_for_bucket(cur, bucket, win, resets_at=resets, cycle=cycle)
         if r is None:
             continue
         pp_h, _first, _last, span_h, synthesized = r
@@ -458,6 +477,79 @@ def fmt_duty_line(
 
 
 # ---------------------------------------------------------------------------
+# Rolling 5-hour bucket
+# ---------------------------------------------------------------------------
+
+def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor) -> None:
+    """Print the rolling 5-hour All-Models bucket stanza.
+
+    Unlike the weekly buckets, the cycle is 5h: the window START is
+    `resets_at − 5h`, so elapsed = now − (resets_at − 5h) and remaining =
+    resets_at − now.  This is the most urgent bucket (shortest fuse), so it's
+    printed first.  Duty-cycle is irrelevant for a 5h window (it spans a single
+    sitting, not multiple days), so there's no duty line.  Trend uses
+    minute-to-hour windows (5m/15m/30m/1h/2h/4h).
+    """
+    latest = latest_for_bucket(cur, FIVE_HOUR_BUCKET)
+    if latest is None:
+        return
+    ts, pct, resets = latest
+    now = datetime.now(timezone.utc)
+
+    print("── All Models (5h) ──")
+    ts_time = parse_iso(ts).astimezone(_LOCAL_TZ).strftime("%H:%M")
+    stale_tag = snapshot_staleness_marker(ts) or ""
+    print(f"  current:   {pct:.1f}%   (snapshot {ts_time}){stale_tag}")
+
+    if not resets:
+        print("  so far:    insufficient data (no reset timestamp)")
+        print()
+        return
+
+    reset_dt = parse_iso(resets)
+    start_dt = reset_dt - FIVE_HOUR_CYCLE          # window START = end − 5h
+    h_to_reset = (reset_dt - now).total_seconds() / 3600.0
+    resets_local = reset_dt.astimezone(_LOCAL_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    print(f"  resets:    {resets_local}  ({fmt_h(h_to_reset)})")
+
+    elapsed_h = (now - start_dt).total_seconds() / 3600.0
+    if elapsed_h <= 0:
+        print("  so far:    insufficient data (window not started)")
+        print()
+        return
+
+    sofar_pp_h = pct / elapsed_h
+    print(f"  so far:    {sofar_pp_h:.2f} pp/hr   ·  {pct:.0f}% over {elapsed_h:.1f}h")
+
+    if h_to_reset == h_to_reset and h_to_reset > 0:
+        headroom = 100.0 - pct
+        rem_pp_h = headroom / h_to_reset
+        verdict = "⚠ over budget — slow down" if sofar_pp_h > rem_pp_h else "✓ within budget"
+        print(f"  remaining: {rem_pp_h:.2f} pp/hr   ·  {headroom:.0f}% over {fmt_h(h_to_reset)}   [{verdict}]")
+
+    tr = fmt_trend(trend_series(cur, FIVE_HOUR_BUCKET, resets, elapsed_h=elapsed_h,
+                                windows=TREND_WINDOWS_5H, cycle=FIVE_HOUR_CYCLE))
+    if tr is not None:
+        print(f"  trend:     {tr}")
+
+    if sofar_pp_h <= 0:
+        print("  ETA:       not increasing — no exhaustion projected")
+    else:
+        pp_remaining = 100.0 - pct
+        hrs_to_100 = pp_remaining / sofar_pp_h
+        exhaust_at = now + timedelta(hours=hrs_to_100)
+        if exhaust_at < reset_dt:
+            margin_h = (reset_dt - exhaust_at).total_seconds() / 3600.0
+            print(f"  ETA:       100% in {fmt_h(hrs_to_100)} "
+                  f"(at {exhaust_at.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
+                  f"⚠ BEFORE reset by {fmt_h(margin_h)}")
+        else:
+            pct_at_reset = pct + sofar_pp_h * h_to_reset
+            print(f"  ETA:       {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Main report
 # ---------------------------------------------------------------------------
 
@@ -467,6 +559,9 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
     print(f"Burn rate report ({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
     print("🕛 round-the-clock · 💼 duty hours")
     print()
+
+    # Rolling 5-hour bucket first — shortest fuse, most urgent.
+    report_five_hour(con, cur)
 
     # Collapse seven_day + all_models_weekly into one logical bucket;
     # pick the bucket with the newest snapshot per label.
