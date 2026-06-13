@@ -12,6 +12,9 @@ Usage:
     python burn_rate.py              # since-reset rate (primary) + 6h recent-rate comparison
     python burn_rate.py --window 1h  # recent comparison window = last hour
     python burn_rate.py --window 24h # recent comparison window = last day
+    python burn_rate.py --mode naive       # existing calculations verbatim (baseline)
+    python burn_rate.py --mode predictive  # Bayesian shrinkage (default)
+    python burn_rate.py --mode target      # even-pace prescriptive projection
 
     # Set a manual reset-epoch override (e.g. when a bucket reset early):
     python burn_rate.py --set-reset-override seven_day 2026-06-09T21:17:03Z
@@ -26,6 +29,16 @@ The primary projection always uses the rate since the last reset (the only
 honest denominator for a weekly bucket). The recent-window rate is shown
 underneath as a comparison so you can see whether you're trending hotter or
 cooler than the week average.
+
+Projection modes (--mode):
+  naive       — existing calculations verbatim: raw pct/elapsed, 06-21 duty window,
+                no shrinkage. Retained as the control/baseline forever.
+  predictive  — (default) Bayesian shrinkage toward a span-correct historical prior.
+                Kills early-week false STOP/bomb alarms while still catching genuine
+                sustained overruns. Uses empirical 07-24 UTC duty surface.
+  target      — Prescriptive even-pace: (remaining budget / remaining time), with
+                duty surface breathing on de-rationed natural demand. Answers "to
+                spread evenly, what's my pace right now and am I ahead of it?"
 
 Manual reset-epoch overrides
 -----------------------------
@@ -53,9 +66,33 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# ---------------------------------------------------------------------------
+# Lazy import of projection module (WS4 shrinkage)
+# ---------------------------------------------------------------------------
+# Import at module level so syntax errors surface immediately; but we guard
+# usage with _PROJECTION_AVAILABLE so the script degrades to naive if the
+# module is absent (e.g. running from an old install path).
+
+_PROJECTION_AVAILABLE = False
+_project_fn = None
+try:
+    import importlib.util as _ilu
+    _proj_path = Path(__file__).parent / "projection.py"
+    if _proj_path.exists():
+        _spec = _ilu.spec_from_file_location("projection", _proj_path)
+        _proj_mod = _ilu.module_from_spec(_spec)
+        # Register before exec so dataclass.__module__ resolution works
+        sys.modules["projection"] = _proj_mod
+        _spec.loader.exec_module(_proj_mod)
+        _project_fn = _proj_mod.project
+        _PROJECTION_AVAILABLE = True
+except Exception as _proj_import_err:
+    print(f"[warn] projection module unavailable: {_proj_import_err}", file=sys.stderr)
 
 DB = Path.home() / ".claude" / "state" / "usage-log.sqlite"
 
@@ -550,13 +587,103 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Shrinkage projection helper (WS4 integration)
+# ---------------------------------------------------------------------------
+
+def _shrinkage_project(
+    con: sqlite3.Connection,
+    cur: sqlite3.Cursor,
+    bucket: str,
+    resets: str,
+    mode: str,
+    override_ts: str | None = None,
+):
+    """Call projection.project() with active-override as the authoritative reset epoch.
+
+    Handles three integration concerns flagged in the project doc:
+
+    1. row_factory compat: projection.open_db() sets sqlite3.Row; burn_rate.py
+       uses indexed tuples.  We pass our own connection — projection functions
+       accept any connection; the row_factory on our connection is not changed.
+
+    2. five_hour guard: the shrinkage prior is built from 7-day weekly windows.
+       For the five_hour bucket the prior falls back to 0.7 pp/hr (the projection
+       module's hard default), which is not calibrated to a 5-hour rolling window.
+       Callers should NOT use this function for five_hour — keep naive logic there.
+
+    3. active-override interop: if burn_rate.py has an active override for this
+       bucket, that override is the authoritative current-window reset epoch.  We
+       inject it into the DB's reset_history table so projection.py picks it up
+       via _get_effective_reset_epoch().  We do this in a savepoint so the write
+       is rolled back after the call — we are only feeding it as a transient hint,
+       not persisting it (reset_overrides and reset_history are different tables).
+
+    Returns a ProjectionResult or None if projection module is unavailable.
+    """
+    if not _PROJECTION_AVAILABLE or _project_fn is None:
+        return None
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+
+    # Inject active override into reset_history as a transient hint so
+    # projection's _get_effective_reset_epoch picks it up.
+    _injected = False
+    if override_ts is not None:
+        try:
+            con.execute("SAVEPOINT _proj_override_hint")
+            # Ensure the reset_history table exists (projection creates it if absent)
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS reset_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bucket TEXT NOT NULL,
+                    reset_ts TEXT NOT NULL,
+                    created_ts TEXT NOT NULL,
+                    source TEXT
+                )"""
+            )
+            # Only inject if not already present for this exact ts
+            existing = con.execute(
+                "SELECT 1 FROM reset_history WHERE bucket=? AND reset_ts=?",
+                (bucket, override_ts),
+            ).fetchone()
+            if existing is None:
+                now_iso = now.isoformat().replace("+00:00", "Z")
+                con.execute(
+                    "INSERT INTO reset_history (bucket, reset_ts, created_ts, source) VALUES (?,?,?,?)",
+                    (bucket, override_ts, now_iso, "override_hint"),
+                )
+                _injected = True
+        except Exception:
+            pass  # non-fatal — projection falls back gracefully
+
+    try:
+        result = _project_fn(con, bucket, now=now, mode=mode)
+    except Exception as e:
+        print(f"  [projection error: {e}]", file=sys.stderr)
+        result = None
+    finally:
+        if _injected:
+            try:
+                con.execute("ROLLBACK TO SAVEPOINT _proj_override_hint")
+                con.execute("RELEASE SAVEPOINT _proj_override_hint")
+            except Exception:
+                pass
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main report
 # ---------------------------------------------------------------------------
 
-def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
+def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
+           mode: str = "predictive"):
     now = datetime.now(timezone.utc)
 
-    print(f"Burn rate report ({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
+    mode_info = f"  [mode: {mode}]" if mode != "predictive" else ""
+    print(f"Burn rate report ({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')}){mode_info}")
     print("🕛 round-the-clock · 💼 duty hours")
     print()
 
@@ -652,39 +779,97 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
             if tr is not None:
                 print(f"  trend:     {tr}")
 
-            if primary_pp_h <= 0:
-                print(f"  ETA:       not increasing — no exhaustion projected")
-            else:
-                pp_remaining = 100.0 - pct
-                hrs_to_100 = pp_remaining / primary_pp_h
-                exhaust_at = now + timedelta(hours=hrs_to_100)
-                if resets and exhaust_at < parse_iso(resets):
-                    margin_h = (parse_iso(resets) - exhaust_at).total_seconds() / 3600.0
-                    print(f"  ETA:       100% in {fmt_h(hrs_to_100)} "
-                          f"(at {exhaust_at.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
-                          f"⚠ BEFORE reset by {fmt_h(margin_h)}")
-                else:
-                    pct_at_reset = pct + primary_pp_h * h_to_reset if h_to_reset == h_to_reset else None
-                    if pct_at_reset is not None:
-                        print(f"  ETA:       {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
-                    else:
-                        print(f"  ETA:       100% in {fmt_h(hrs_to_100)} (no reset known)")
-
-            # ── Duty-cycle projection ──────────────────────────────────────
-            # Same pp/hr rate, but burn only accrues during active hours
-            # (ACTIVE_START_HOUR–ACTIVE_END_HOUR local time).
-            if resets:
-                reset_utc = parse_iso(resets)
-                dc_pct_at_reset, dc_exhaust = duty_cycle_eta(
-                    now, pct, primary_pp_h, reset_utc
+            # ── Projection (ETA + duty) ────────────────────────────────────
+            # In naive mode: existing raw pct/elapsed logic verbatim.
+            # In predictive/target mode: Bayesian shrinkage via projection.py;
+            # falls back to naive if the module is unavailable.
+            shrink_result = None
+            if mode != "naive" and resets:
+                active_override_ts = effective_reset_ts if override_active else None
+                shrink_result = _shrinkage_project(
+                    con, cur, bucket, resets, mode,
+                    override_ts=active_override_ts,
                 )
-                print(fmt_duty_line(dc_pct_at_reset, dc_exhaust, now, reset_utc))
+
+            if shrink_result is not None:
+                # Shrinkage projection available — show both raw and shrinkage
+                sr = shrink_result
+                mode_label = f"[{mode}]"
+                if primary_pp_h <= 0:
+                    print(f"  ETA:       not increasing — no exhaustion projected")
+                else:
+                    # Naive ETA for context
+                    pp_remaining = 100.0 - pct
+                    hrs_to_100_naive = pp_remaining / primary_pp_h
+                    # Shrinkage-projected % at reset (round-the-clock)
+                    sproj = sr.projected_pct_at_reset
+                    sproj_duty = sr.duty_projected_pct
+                    prior_s = f"{sr.prior_pp_h:.3f}" if sr.prior_pp_h is not None else "n/a"
+                    print(
+                        f"  projection {mode_label}:  "
+                        f"rtc={sproj:.1f}%   duty={sproj_duty:.1f}%  "
+                        f"(eff_rate={sr.effective_rate_pp_h:.3f} pp/hr  "
+                        f"prior={prior_s} pp/hr  K={sr.k_used:.0f}h  "
+                        f"windows={sr.prior_window_count})"
+                    )
+                    # Show ETA using shrinkage-effective rate (more honest)
+                    eff_rate = sr.effective_rate_pp_h
+                    if eff_rate > 0:
+                        hrs_to_100_eff = pp_remaining / eff_rate
+                        exhaust_at_eff = now + timedelta(hours=hrs_to_100_eff)
+                        if resets and exhaust_at_eff < parse_iso(resets):
+                            margin_h = (parse_iso(resets) - exhaust_at_eff).total_seconds() / 3600.0
+                            print(f"  ETA:       100% in {fmt_h(hrs_to_100_eff)} "
+                                  f"(at {exhaust_at_eff.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
+                                  f"⚠ BEFORE reset by {fmt_h(margin_h)}")
+                        else:
+                            print(f"  ETA:       {sproj:.1f}% by reset  (no exhaustion at this rate)")
+                    else:
+                        print(f"  ETA:       not increasing — no exhaustion projected")
+                    # Duty line using shrinkage duty projection
+                    if resets:
+                        reset_utc = parse_iso(resets)
+                        # Use shrinkage effective rate for duty exhaustion search
+                        dc_pct_at_reset_eff, dc_exhaust_eff = duty_cycle_eta(
+                            now, pct, eff_rate, reset_utc
+                        )
+                        # Override the pct_at_reset with the shrinkage duty projection
+                        # (more accurate — uses empirical 07-24 UTC active hours)
+                        print(fmt_duty_line(sproj_duty, dc_exhaust_eff, now, reset_utc))
             else:
-                print(f"  duty:      no reset timestamp — cannot compute")
+                # Naive mode (or projection unavailable): existing logic verbatim
+                if primary_pp_h <= 0:
+                    print(f"  ETA:       not increasing — no exhaustion projected")
+                else:
+                    pp_remaining = 100.0 - pct
+                    hrs_to_100 = pp_remaining / primary_pp_h
+                    exhaust_at = now + timedelta(hours=hrs_to_100)
+                    if resets and exhaust_at < parse_iso(resets):
+                        margin_h = (parse_iso(resets) - exhaust_at).total_seconds() / 3600.0
+                        print(f"  ETA:       100% in {fmt_h(hrs_to_100)} "
+                              f"(at {exhaust_at.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
+                              f"⚠ BEFORE reset by {fmt_h(margin_h)}")
+                    else:
+                        pct_at_reset = pct + primary_pp_h * h_to_reset if h_to_reset == h_to_reset else None
+                        if pct_at_reset is not None:
+                            print(f"  ETA:       {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
+                        else:
+                            print(f"  ETA:       100% in {fmt_h(hrs_to_100)} (no reset known)")
+
+                # ── Duty-cycle projection (naive) ──────────────────────────
+                if resets:
+                    reset_utc = parse_iso(resets)
+                    dc_pct_at_reset, dc_exhaust = duty_cycle_eta(
+                        now, pct, primary_pp_h, reset_utc
+                    )
+                    print(fmt_duty_line(dc_pct_at_reset, dc_exhaust, now, reset_utc))
+                else:
+                    print(f"  duty:      no reset timestamp — cannot compute")
         print()
 
 
-def autonomous_status(con, cur, ceiling: float, window: timedelta) -> int:
+def autonomous_status(con, cur, ceiling: float, window: timedelta,
+                      mode: str = "predictive") -> int:
     """Compact, parseable self-regulation status for autonomous runs.
 
     Gates (James's rule): keep each weekly bucket's projected-%-at-reset under
@@ -694,12 +879,19 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta) -> int:
     gate — an autonomous bot burns continuously, so rtc is the honest model;
     duty is shown as secondary context.
 
+    In predictive/target mode the gate uses shrinkage-projected % at reset
+    instead of raw pct/elapsed, killing early-week false STOPs while still
+    catching genuine sustained overruns. The recent-rate-vs-budget dual-signal
+    is preserved: shrinkage only replaces the projection signal, not the
+    recent-rate check.
+
     Emits one line per bucket plus a single `VERDICT: GO|CAUTION|STOP`.
     Returns 0/1/2 (GO/CAUTION/STOP) as the process exit code so callers can
     branch on it without parsing.
     """
     now = datetime.now(timezone.utc)
-    print(f"AUTONOMOUS STATUS  ceiling={ceiling:.0f}%  "
+    mode_label = f"[{mode}]" if mode != "naive" else "[naive]"
+    print(f"AUTONOMOUS STATUS  ceiling={ceiling:.0f}%  mode={mode}  "
           f"({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
 
     # Bucket set: rolling 5h + the freshest weekly per display label.
@@ -727,19 +919,46 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta) -> int:
             print(f"  {tag:6s} cur={pct:.1f}%  (no reset timestamp — skipped)")
             continue
         h_to_reset = hours_until(resets)
+
+        # --- Naive baseline numbers (always computed) ---
         prev_reset_dt = parse_iso(resets) - cycle
         elapsed_h = (now - prev_reset_dt).total_seconds() / 3600.0
-        pp_h = pct / elapsed_h if elapsed_h > 0 else 0.0
-        proj_raw = pct + pp_h * h_to_reset if h_to_reset == h_to_reset else pct
-        proj_duty, _ = duty_cycle_eta(now, pct, pp_h, parse_iso(resets))
+        pp_h_naive = pct / elapsed_h if elapsed_h > 0 else 0.0
+        proj_raw_naive = pct + pp_h_naive * h_to_reset if h_to_reset == h_to_reset else pct
+        proj_duty_naive, _ = duty_cycle_eta(now, pct, pp_h_naive, parse_iso(resets))
+
         budget = ((ceiling - pct) / h_to_reset
                   if (h_to_reset == h_to_reset and h_to_reset > 0) else 0.0)
         r = rate_for_bucket(cur, bucket, window, resets, cycle=cycle)
         recent = r[0] if r else float("nan")
 
+        # --- Shrinkage projection (for weekly buckets only, not 5h) ---
+        # five_hour uses naive logic — the weekly-trained prior is not calibrated
+        # for a 5-hour rolling window and would produce a nonsense projection.
+        proj_raw = proj_raw_naive  # default: naive
+        proj_duty = proj_duty_naive
+        shrink_note = ""
+
+        if mode != "naive" and tag != "5h" and _PROJECTION_AVAILABLE:
+            # Wire active override so shrinkage uses the correct window epoch
+            eff_ts, ov_active = check_and_expire_override(con, cur, bucket, resets)
+            active_override_ts = eff_ts if ov_active else None
+            sr = _shrinkage_project(con, cur, bucket, resets, mode,
+                                    override_ts=active_override_ts)
+            if sr is not None:
+                proj_raw = sr.projected_pct_at_reset
+                proj_duty = sr.duty_projected_pct
+                prior_s = f"{sr.prior_pp_h:.3f}" if sr.prior_pp_h is not None else "?"
+                shrink_note = (
+                    f"  shrinkage: eff={sr.effective_rate_pp_h:.3f}pp/hr  "
+                    f"prior={prior_s}pp/hr  K={sr.k_used:.0f}h  wins={sr.prior_window_count}"
+                )
+
         over_now = pct >= ceiling
         proj_over = proj_raw >= ceiling
         recent_hot = (recent == recent) and (recent > budget)
+        # Gate logic: shrinkage projection replaces the raw projection check,
+        # but the recent-rate signal is preserved (dual-signal behaviour).
         if over_now or (proj_over and recent_hot):
             state, lvl = "STOP", 2
         elif proj_over or recent_hot:
@@ -751,7 +970,8 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta) -> int:
             if over_now:
                 reasons.append(f"{tag} already {pct:.0f}% ≥ {ceiling:.0f}%")
             elif proj_over:
-                reasons.append(f"{tag} projected {proj_raw:.0f}% ≥ {ceiling:.0f}%")
+                proj_source = mode_label if tag != "5h" else "[naive]"
+                reasons.append(f"{tag} projected {proj_raw:.0f}% ≥ {ceiling:.0f}% {proj_source}")
             if recent_hot:
                 reasons.append(f"{tag} recent {recent:.2f} > budget {budget:.2f} pp/hr")
 
@@ -760,6 +980,8 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta) -> int:
         duty_str = f"{proj_duty:.0f}" if proj_duty is not None else "—"
         print(f"  {tag:6s} cur={pct:.1f}%  proj={proj_raw:.0f}%(rtc)/{duty_str}%(duty)  "
               f"budget={budget_str}pp/hr  recent={recent_str}pp/hr  → {state}")
+        if shrink_note:
+            print(shrink_note)
 
     verdict = ("GO", "CAUTION", "STOP")[worst]
     if reasons:
@@ -777,6 +999,11 @@ def main():
 Examples:
   python burn_rate.py                                    # default 6h comparison window
   python burn_rate.py --window 1h                        # 1h comparison window
+  python burn_rate.py --mode naive                       # existing calculations verbatim (baseline)
+  python burn_rate.py --mode predictive                  # Bayesian shrinkage (default)
+  python burn_rate.py --mode target                      # even-pace prescriptive projection
+  python burn_rate.py --autonomous-status                # compact GO/CAUTION/STOP verdict
+  python burn_rate.py --autonomous-status --mode naive   # gate using naive projection
   python burn_rate.py --set-reset-override seven_day 2026-06-09T21:17:03Z
   python burn_rate.py --clear-reset-override seven_day
   python burn_rate.py --list-reset-overrides
@@ -785,6 +1012,15 @@ Examples:
     ap.add_argument(
         "--window", default="6h",
         help="Lookback window for burn rate comparison (e.g. 1h, 6h, 24h, 3d). Default 6h.",
+    )
+    ap.add_argument(
+        "--mode", default="predictive", choices=["naive", "predictive", "target"],
+        help=(
+            "Projection mode: naive = existing raw pct/elapsed (baseline, verbatim); "
+            "predictive = Bayesian shrinkage toward historical prior (default, kills early-week "
+            "false alarms); target = even-pace prescriptive (remaining budget / remaining time). "
+            "Applies to both the report and --autonomous-status."
+        ),
     )
     ap.add_argument(
         "--autonomous-status", action="store_true",
@@ -853,10 +1089,10 @@ Examples:
         return
 
     if args.autonomous_status:
-        import sys as _sys
-        _sys.exit(autonomous_status(con, cur, args.ceiling, parse_window(args.window)))
+        sys.exit(autonomous_status(con, cur, args.ceiling, parse_window(args.window),
+                                   mode=args.mode))
 
-    report(parse_window(args.window), con, cur)
+    report(parse_window(args.window), con, cur, mode=args.mode)
 
 
 if __name__ == "__main__":
