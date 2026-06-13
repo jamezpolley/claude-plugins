@@ -170,21 +170,19 @@ def _render_five_hour(used: float, resets_at_epoch: int, mode: str, conn) -> str
     else:
         proj = 0.0
 
-    # Use current% for colour/glyph on the bucket label; projected for the →proj
-    cur_col = _colour(used)
-    cur_glyph = _glyph(used)
-    proj_col = _colour(proj)
-    proj_glyph = _glyph(proj)
+    # One colour block per bucket, driven by the PROJECTED value (where you'll
+    # land) — current%, →proj%, AND the countdown all share it. (James 2026-06-13)
+    col = _colour(proj)
+    glyph = _glyph(proj)
 
     countdown = _fmt_countdown(max(remaining, 0))
 
-    # Format: │ glyph 5h:46%→87% ⌛2h52m
-    # glyph and colour on current%, proj colour on →proj%
+    # Format: │ glyph 5h:46%→87% ⏳2h52m  (whole token + countdown, one colour)
     proj_int = int(round(proj))
     cur_int = int(round(used))
     return (
-        f" {_SEP} {cur_col}{cur_glyph} 5h:{cur_int}%"
-        f"→{proj_col}{proj_int}%{_RESET}{countdown}"
+        f" {_SEP} {col}{glyph} 5h:{cur_int}%"
+        f"→{proj_int}%{countdown}{_RESET}"
     )
 
 
@@ -225,40 +223,42 @@ def _render_seven_day(used: float, resets_at_epoch: int, duty_pct: float | None,
         inline_proj = naive_proj
         shrink_duty = None
 
-    cur_col = _colour(used)
-    cur_glyph = _glyph(used)
-    proj_col = _colour(inline_proj)
-    proj_glyph = _glyph(inline_proj)
+    # One colour block per bucket, driven by the PROJECTED value. The 7d reset
+    # countdown moves to the END of the stanza (after duty) and takes the colour
+    # of the block immediately before it — duty if present, else the 7d block.
+    # (James 2026-06-13)
+    col = _colour(inline_proj)
+    glyph = _glyph(inline_proj)
 
     countdown = _fmt_countdown(max(remaining, 0))
     cur_int = int(round(used))
     proj_int = int(round(inline_proj))
 
-    # Main segment
-    seg = (
-        f" {_SEP} {cur_col}{cur_glyph} 7d:{cur_int}%"
-        f"→{proj_col}{proj_int}%{_RESET}{countdown}"
-    )
+    # 7d token — whole thing one colour, NO countdown here (it moves to the end)
+    seg = f" {_SEP} {col}{glyph} 7d:{cur_int}%→{proj_int}%{_RESET}"
 
-    # Duty segment — prefer shrinkage duty, fall back to sentinel
-    # Both use the same stale-guard: if sentinel is stale, dim grey + trailing ~
+    # Duty segment — prefer shrinkage duty, fall back to sentinel. The trailing
+    # countdown is appended INSIDE the duty colour block (the block before it).
     effective_duty = shrink_duty if shrink_duty is not None else duty_pct
     if effective_duty is not None:
         duty_int = int(round(effective_duty))
         stale = duty_stale and shrink_duty is None  # only apply stale if using sentinel
         if stale:
             duty_col = _DIM_GREY
-            seg += f" {_SEP} {duty_col}duty:{effective_duty:.1f}%~{_RESET}"
+            seg += f" {_SEP} {duty_col}duty:{effective_duty:.1f}%~{countdown}{_RESET}"
         else:
             duty_col = _colour(duty_int)
             duty_glyph = _glyph(duty_int)
             if duty_int >= 90:
                 seg += (
                     f" {_SEP} {duty_col}{duty_glyph} duty:{effective_duty:.1f}% "
-                    f"{duty_glyph}{_RESET}"
+                    f"{duty_glyph}{countdown}{_RESET}"
                 )
             else:
-                seg += f" {_SEP} {duty_col}duty:{effective_duty:.1f}%{_RESET}"
+                seg += f" {_SEP} {duty_col}duty:{effective_duty:.1f}%{countdown}{_RESET}"
+    else:
+        # No duty available: the countdown attaches to the 7d block, in its colour.
+        seg = f" {_SEP} {col}{glyph} 7d:{cur_int}%→{proj_int}%{countdown}{_RESET}"
 
     return seg
 
