@@ -188,6 +188,36 @@ RECENCY_MATURE_MIN = 8
 RECENCY_ROLLING_WEEKS = 12        # rolling window cap once mature
 RECENCY_DECAY_HALFLIFE_WEEKS = 5  # exponential-decay half-life (4-6wk range)
 
+# ---------------------------------------------------------------------------
+# WS16: 5h activity-weighted shrinkage constants
+# ---------------------------------------------------------------------------
+# K for 5h shrinkage prior: 1 hour of pseudo-evidence.  Much shorter than the
+# 24h K used for the weekly bucket — the 5h window is itself only 5 hours, so
+# a 24h K would swamp all real observations.  1h means the blend crosses into
+# observation-dominated at elapsed=1h, which is about 20% into the 5h window.
+FIVE_HOUR_K_SECONDS = 3600.0   # K = 1.0 hours in seconds
+
+# Active-fraction clamp for the 5h projection: keeps the projected remaining
+# active time from going to 0 (all-idle) or 1 (all-active) based on a very
+# short elapsed sample.
+FIVE_HOUR_ACTIVE_FRAC_MIN = 0.1
+FIVE_HOUR_ACTIVE_FRAC_MAX = 0.9
+
+# Minimum active elapsed (seconds) before using activity-weighted path;
+# below this the denominator is too small to produce a stable per-active-hour
+# rate, so we fall back to the naive wall-clock path.
+FIVE_HOUR_MIN_ACTIVE_S = 60.0
+
+# Account-separation limitation (documented): the 5h bucket has no
+# Saturday-reset anchor to distinguish work vs personal account.  All-account
+# tokens are used for the 5h projection.  This is noted here so future work
+# can add an account separator when the DB starts tagging rows by account.
+# See WS16 in Burn-Rate_Plugin_Consolidation.md.
+FIVE_HOUR_ACCOUNT_NOTE = (
+    "5h projection uses all-account tokens (no Saturday-reset anchor to "
+    "separate work vs personal quota); limitation documented in WS16."
+)
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -1622,6 +1652,350 @@ def project(
         prior_window_count=prior_window_count,
         notes=notes,
     )
+
+
+# ---------------------------------------------------------------------------
+# WS16: 5h activity-weighted shrinkage projection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FiveHourProjectionResult:
+    """Result of project_five_hour().
+
+    All time values are in seconds.  The headline field is
+    `projected_pct_at_reset` — the activity-weighted shrinkage estimate.
+    """
+    current_pct: float
+    elapsed_wall_s: float          # wall seconds since window start
+    active_elapsed_s: float        # active (non-idle) seconds elapsed
+    idle_s: float                  # idle seconds excluded from denominator
+    active_fraction: float         # active_elapsed / wall_elapsed (clamped)
+    obs_active_rate_pp_s: float    # observed pp per active second
+    prior_rate_pp_s: float         # trailing ~5h activity rate (prior)
+    blended_rate_pp_s: float       # shrinkage-blended per-active-second rate
+    projected_pct_at_reset: float  # headline: blended_rate × expected_active_remaining
+    path: str                      # 'activity_weighted' | 'naive_fallback'
+    notes: list[str]
+
+
+def _compute_active_elapsed_from_snapshots(
+    snapshots: list[tuple[datetime, float]],
+    wall_elapsed_s: float,
+) -> float:
+    """Compute active elapsed seconds by excluding idle gaps.
+
+    A gap between consecutive snapshots is considered idle if the implied
+    burn rate over that gap is below IDLE_FLOOR_PP_H.  This mirrors the same
+    logic used in the duty-surface histogram to distinguish active vs idle
+    sessions.
+
+    Parameters
+    ----------
+    snapshots : sorted [(ts, pct), ...] for the current 5h window
+    wall_elapsed_s : total wall seconds elapsed (for fallback)
+
+    Returns
+    -------
+    active_elapsed_s : float  (seconds that were genuinely active)
+    """
+    if len(snapshots) < 2:
+        return wall_elapsed_s   # can't determine activity from a single point
+
+    active_s = 0.0
+    for i in range(1, len(snapshots)):
+        t_prev, pct_prev = snapshots[i - 1]
+        t_curr, pct_curr = snapshots[i]
+        gap_s = (t_curr - t_prev).total_seconds()
+        if gap_s <= 0:
+            continue
+        gap_h = gap_s / 3600.0
+        delta = pct_curr - pct_prev
+        # Only count positive-delta (burning) intervals toward active time.
+        # Flat or decreasing intervals are idle (or a reset — excluded upstream).
+        if delta > 0:
+            rate_pp_h = delta / gap_h
+            if rate_pp_h >= IDLE_FLOOR_PP_H:
+                # Active interval
+                active_s += gap_s
+            # Sub-floor positive delta: small enough to be noise/idle session —
+            # not counted as active time.
+    return active_s
+
+
+def _compute_prior_rate_from_snapshots(
+    snapshots: list[tuple[datetime, float]],
+    window_start: datetime,
+    prior_wall_s: float = 5 * 3600.0,
+) -> Optional[float]:
+    """Compute the trailing activity-rate prior from recent snapshots.
+
+    Uses the last `prior_wall_s` seconds of wall time (default = one full 5h
+    window) as the trailing window for the prior.  Within that window, only
+    active intervals (rate >= IDLE_FLOOR_PP_H) are counted — same as
+    _compute_active_elapsed_from_snapshots.
+
+    Returns pp per active second, or None if there are no active intervals in
+    the trailing window.
+
+    This prior anchors the shrinkage to recent activity, not a historical
+    average.  For the 5h bucket there is no multi-week history to draw from
+    (unlike the weekly buckets), so the prior is derived from the recent same-
+    window activity rather than from completed past windows.
+    """
+    if len(snapshots) < 2:
+        return None
+
+    # Trailing window boundary: start at (last_ts - prior_wall_s) or window_start
+    last_ts = snapshots[-1][0]
+    trailing_start = max(window_start, last_ts - timedelta(seconds=prior_wall_s))
+
+    sum_pp = 0.0
+    sum_active_s = 0.0
+
+    for i in range(1, len(snapshots)):
+        t_prev, pct_prev = snapshots[i - 1]
+        t_curr, pct_curr = snapshots[i]
+        # Only consider intervals starting at or after trailing_start
+        if t_curr <= trailing_start:
+            continue
+        # Clamp to trailing window
+        seg_start = max(t_prev, trailing_start)
+        gap_s = (t_curr - seg_start).total_seconds()
+        if gap_s <= 0:
+            continue
+        gap_h = gap_s / 3600.0
+        delta = pct_curr - pct_prev
+        if delta <= 0:
+            continue
+        rate_pp_h = delta / gap_h
+        if rate_pp_h >= IDLE_FLOOR_PP_H:
+            sum_pp += delta
+            sum_active_s += gap_s
+
+    if sum_active_s <= 0:
+        return None
+    return sum_pp / sum_active_s   # pp per active second
+
+
+def project_five_hour(
+    conn: sqlite3.Connection,
+    now: Optional[datetime] = None,
+) -> Optional[FiveHourProjectionResult]:
+    """WS16: Activity-weighted shrinkage projection for the five_hour bucket.
+
+    Design (see WS16 in Burn-Rate_Plugin_Consolidation.md):
+
+    1. Active-rate denominator: exclude idle gaps (rate < IDLE_FLOOR_PP_H)
+       from the elapsed-time denominator.  Avoids naive wall-clock extrapolation
+       that swings wildly (5% → 102% → 89% → 105% on noise) because early
+       snapshots may reflect a mostly-idle window.
+
+    2. Shrinkage prior: trailing ~5h activity rate (last full window's worth of
+       active intervals).  K = 1h (3600s).  At elapsed=K the observed and prior
+       rates are weighted equally; at elapsed >> K the projection is
+       observation-dominated.
+
+       Blended = (obs_active_rate × active_elapsed + prior_rate × K) /
+                 (active_elapsed + K)
+
+    3. Project over active-hours-remaining (units consistency — WS13 lesson):
+       per-active-second rate × expected-active-seconds-remaining.
+
+       expected_active_s_remaining = active_fraction × wall_s_remaining
+
+       where active_fraction = active_elapsed / wall_elapsed,
+       clamped to [FIVE_HOUR_ACTIVE_FRAC_MIN, FIVE_HOUR_ACTIVE_FRAC_MAX].
+
+    4. Account-separation limitation: no Saturday-reset anchor to distinguish
+       work vs personal account for the 5h bucket.  All-account tokens used.
+       See FIVE_HOUR_ACCOUNT_NOTE.
+
+    Falls back to the naive wall-clock path when:
+      - active_elapsed_s < FIVE_HOUR_MIN_ACTIVE_S (div-zero guard)
+      - No data / no reset timestamp
+
+    Returns FiveHourProjectionResult or None if no 5h snapshot exists.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # --- Fetch latest snapshot ---
+    row = conn.execute(
+        "SELECT snapshot_ts, pct_used, resets_at FROM quota_snapshots "
+        "WHERE bucket='five_hour' AND resets_at NOT IN ('2286-11-20T17:46:39Z') "
+        "ORDER BY snapshot_ts DESC LIMIT 1",
+    ).fetchone()
+    if row is None:
+        return None
+
+    ts_str, current_pct, resets_at_raw = row
+    if not resets_at_raw:
+        return None
+
+    try:
+        reset_dt = _to_utc(_parse_iso(resets_at_raw))
+        window_start = reset_dt - timedelta(hours=5)
+        wall_elapsed_s = (now - window_start).total_seconds()
+        wall_s_remaining = (reset_dt - now).total_seconds()
+    except Exception:
+        return None
+
+    if wall_elapsed_s <= 0 or wall_s_remaining <= 0:
+        return None
+
+    # --- Fetch all snapshots for current 5h window ---
+    snapshots_raw = conn.execute(
+        "SELECT snapshot_ts, pct_used FROM quota_snapshots "
+        "WHERE bucket='five_hour' AND resets_at=? "
+        "ORDER BY snapshot_ts ASC",
+        (resets_at_raw,),
+    ).fetchall()
+
+    snapshots: list[tuple[datetime, float]] = []
+    for ts_s, pct in snapshots_raw:
+        try:
+            ts_dt = _to_utc(_parse_iso(ts_s))
+            if window_start <= ts_dt <= now:
+                snapshots.append((ts_dt, pct))
+        except Exception:
+            continue
+
+    notes: list[str] = [FIVE_HOUR_ACCOUNT_NOTE]
+
+    # Naive fallback values (always computable)
+    naive_rate_pp_s = current_pct / wall_elapsed_s if wall_elapsed_s > 0 else 0.0
+    naive_proj = current_pct + naive_rate_pp_s * wall_s_remaining
+
+    # --- Compute active elapsed seconds ---
+    active_elapsed_s = _compute_active_elapsed_from_snapshots(snapshots, wall_elapsed_s)
+
+    # Guard: if active elapsed is negligible, fall back to naive
+    if active_elapsed_s < FIVE_HOUR_MIN_ACTIVE_S:
+        notes.append(
+            f"Active elapsed {active_elapsed_s:.0f}s < min {FIVE_HOUR_MIN_ACTIVE_S:.0f}s — "
+            f"using naive wall-clock path"
+        )
+        return FiveHourProjectionResult(
+            current_pct=current_pct,
+            elapsed_wall_s=wall_elapsed_s,
+            active_elapsed_s=active_elapsed_s,
+            idle_s=wall_elapsed_s - active_elapsed_s,
+            active_fraction=0.0,
+            obs_active_rate_pp_s=0.0,
+            prior_rate_pp_s=0.0,
+            blended_rate_pp_s=naive_rate_pp_s,
+            projected_pct_at_reset=naive_proj,
+            path='naive_fallback',
+            notes=notes,
+        )
+
+    # --- Per-active-second observed rate ---
+    obs_active_rate_pp_s = current_pct / active_elapsed_s
+
+    # --- Prior: trailing ~5h activity rate ---
+    prior_rate_pp_s_raw = _compute_prior_rate_from_snapshots(
+        snapshots, window_start, prior_wall_s=5 * 3600.0
+    )
+    if prior_rate_pp_s_raw is None:
+        # No active intervals found for prior — use observed rate as its own prior
+        # (shrinkage will be neutral; projection still benefits from active denominator)
+        prior_rate_pp_s = obs_active_rate_pp_s
+        notes.append("Prior fallback: no trailing active intervals — using observed rate as prior")
+    else:
+        prior_rate_pp_s = prior_rate_pp_s_raw
+        notes.append(
+            f"Prior: {prior_rate_pp_s * 3600:.4f} pp/hr active "
+            f"(trailing ~5h activity, K={FIVE_HOUR_K_SECONDS/3600:.1f}h)"
+        )
+
+    # --- Shrinkage blend ---
+    # blended = (obs * active_elapsed + prior * K) / (active_elapsed + K)
+    K = FIVE_HOUR_K_SECONDS
+    blended_rate_pp_s = (
+        (obs_active_rate_pp_s * active_elapsed_s + prior_rate_pp_s * K)
+        / (active_elapsed_s + K)
+    )
+    notes.append(
+        f"Shrinkage: obs={obs_active_rate_pp_s*3600:.4f} pp/hr-active × {active_elapsed_s:.0f}s "
+        f"+ prior={prior_rate_pp_s*3600:.4f} pp/hr-active × K={K:.0f}s → "
+        f"blended={blended_rate_pp_s*3600:.4f} pp/hr-active"
+    )
+
+    # --- Active fraction (clamped) ---
+    active_fraction = active_elapsed_s / wall_elapsed_s
+    active_fraction = max(FIVE_HOUR_ACTIVE_FRAC_MIN, min(FIVE_HOUR_ACTIVE_FRAC_MAX, active_fraction))
+    notes.append(
+        f"Active fraction: {active_fraction:.2f} "
+        f"(raw={active_elapsed_s/wall_elapsed_s:.2f}, "
+        f"clamped to [{FIVE_HOUR_ACTIVE_FRAC_MIN}, {FIVE_HOUR_ACTIVE_FRAC_MAX}])"
+    )
+
+    # --- Project over active-hours-remaining (WS13 units consistency) ---
+    # NEVER multiply a per-active-second rate by wall seconds remaining.
+    expected_active_s_remaining = active_fraction * wall_s_remaining
+    projected_pct = current_pct + blended_rate_pp_s * expected_active_s_remaining
+    notes.append(
+        f"Projection: {current_pct:.1f}% + {blended_rate_pp_s*3600:.4f} pp/hr-active "
+        f"× {expected_active_s_remaining/3600:.2f}h active-remaining "
+        f"= {projected_pct:.1f}%"
+    )
+
+    return FiveHourProjectionResult(
+        current_pct=current_pct,
+        elapsed_wall_s=wall_elapsed_s,
+        active_elapsed_s=active_elapsed_s,
+        idle_s=wall_elapsed_s - active_elapsed_s,
+        active_fraction=active_fraction,
+        obs_active_rate_pp_s=obs_active_rate_pp_s,
+        prior_rate_pp_s=prior_rate_pp_s,
+        blended_rate_pp_s=blended_rate_pp_s,
+        projected_pct_at_reset=projected_pct,
+        path='activity_weighted',
+        notes=notes,
+    )
+
+
+def stability_demo_5h(
+    pct: float,
+    elapsed_wall_s: float,
+    active_fraction: float,
+    prior_rate_pp_h: float = 1.0,
+) -> float:
+    """Simulate a single 5h projection for the stability demo.
+
+    Used by --test-5h-stability to show that small noise in early-window data
+    no longer produces wild swings (5% → 102% → 89% → 105%).
+
+    Parameters:
+      pct               : current % used
+      elapsed_wall_s    : seconds elapsed in window so far
+      active_fraction   : fraction of elapsed time that was active (0–1)
+      prior_rate_pp_h   : prior active rate in pp/hr
+
+    Returns: projected % at end of 5h window.
+    """
+    total_window_s = 5 * 3600.0
+    wall_s_remaining = total_window_s - elapsed_wall_s
+    if wall_s_remaining <= 0:
+        return pct
+
+    active_elapsed_s = active_fraction * elapsed_wall_s
+    if active_elapsed_s < FIVE_HOUR_MIN_ACTIVE_S:
+        # naive fallback
+        naive_rate = pct / elapsed_wall_s if elapsed_wall_s > 0 else 0.0
+        return pct + naive_rate * wall_s_remaining
+
+    obs_active_rate_pp_s = pct / active_elapsed_s
+    prior_rate_pp_s = prior_rate_pp_h / 3600.0
+    K = FIVE_HOUR_K_SECONDS
+    blended_rate_pp_s = (
+        (obs_active_rate_pp_s * active_elapsed_s + prior_rate_pp_s * K)
+        / (active_elapsed_s + K)
+    )
+    active_fraction_clamped = max(FIVE_HOUR_ACTIVE_FRAC_MIN,
+                                   min(FIVE_HOUR_ACTIVE_FRAC_MAX, active_fraction))
+    expected_active_s_remaining = active_fraction_clamped * wall_s_remaining
+    return pct + blended_rate_pp_s * expected_active_s_remaining
 
 
 # ---------------------------------------------------------------------------
