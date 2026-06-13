@@ -558,7 +558,8 @@ def fmt_duty_line(
 # Rolling 5-hour bucket
 # ---------------------------------------------------------------------------
 
-def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "predictive") -> None:
+def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "predictive",
+                     verbose: bool = False) -> None:
     """Print the rolling 5-hour All-Models bucket stanza.
 
     Unlike the weekly buckets, the cycle is 5h: the window START is
@@ -635,10 +636,15 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "
                 pred_col = _colour_for_pct(upper_pct)
                 rst = _reset()
 
+                floor_pct_i = int(round(floor_pct))
+                upper_pct_i = int(round(upper_pct))
+                if verbose:
+                    pred_detail = f"   (eff active={act_frac_pct:.0f}%, K=1h  optimistic–flat-out)"
+                else:
+                    pred_detail = ""
                 print(
-                    f"  predicted: {pred_col}{floor_pct:.1f}% → {upper_pct:.1f}% by reset"
-                    f"   (optimistic: active={act_frac_pct:.0f}% of elapsed, K=1h;"
-                    f" if you sustain 24/7)"
+                    f"  predicted: {pred_col}{floor_pct_i}–{upper_pct_i}% at reset"
+                    f"{pred_detail}"
                     f"   {pred_glyph}{rst}"
                 )
 
@@ -651,20 +657,24 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "
                         ratio = blended_pp_h / even_pace if even_pace > 0 else float("nan")
                         if ratio == ratio:
                             if ratio >= 1.05:
-                                pace_verdict = f"→  {ratio:.1f}× over"
+                                pace_verdict = f"({ratio:.1f}× over)"
                                 target_col = _colour_for_pct(upper_pct)
                             elif ratio <= 0.95:
-                                pace_verdict = f"→  {ratio:.1f}× under"
+                                headroom_pct = (even_pace - blended_pp_h) / even_pace * 100
+                                pace_verdict = f"(~{headroom_pct:.0f}% headroom)"
                                 target_col = _colour_for_pct(0)
                             else:
-                                pace_verdict = "→  on pace"
+                                pace_verdict = "(on pace)"
                                 target_col = _colour_for_pct(0)
                         else:
                             pace_verdict = ""
                             target_col = ""
+                        you_label = f"you're ~{sofar_pp_h:.2f}"
+                        if verbose:
+                            you_label += "  (eff_rate)"
                         print(
-                            f"  target:    {target_col}≤{even_pace:.2f} pp/hr from here to land at 100%"
-                            f"  ·  you're at {sofar_pp_h:.2f}  {pace_verdict}{rst}"
+                            f"  target:    {target_col}≤{even_pace:.2f} pp/hr to stay on track"
+                            f"  ·  {you_label}  {pace_verdict}{rst}"
                         )
                     else:
                         print(f"  target:    n/a (already at ceiling)")
@@ -786,7 +796,7 @@ def _shrinkage_project(
 # ---------------------------------------------------------------------------
 
 def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
-           mode: str = "predictive"):
+           mode: str = "predictive", verbose: bool = False):
     now = datetime.now(timezone.utc)
 
     mode_info = f"  [mode: {mode}]" if mode != "predictive" else ""
@@ -795,7 +805,7 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
     print()
 
     # Rolling 5-hour bucket first — shortest fuse, most urgent.
-    report_five_hour(con, cur, mode=mode)
+    report_five_hour(con, cur, mode=mode, verbose=verbose)
 
     # Collapse seven_day + all_models_weekly into one logical bucket;
     # pick the bucket with the newest snapshot per label.
@@ -928,38 +938,50 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
                     pred_col = _colour_for_pct(sproj_rtc)
                     rst = _reset()
 
-                    # Parenthetical: eff_rate, prior, K, windows
+                    # predicted: integer range (duty floor – rtc upper), jargon behind --verbose
+                    sproj_duty_i = int(round(sproj_duty))
+                    sproj_rtc_i  = int(round(sproj_rtc))
+                    if verbose:
+                        pred_detail = (
+                            f"   (eff {eff_rate:.2f} pp/hr, prior={prior_s},"
+                            f" K={sr.k_used:.0f}h, wins={sr.prior_window_count}"
+                            f"  optimistic–flat-out)"
+                        )
+                    else:
+                        pred_detail = ""
                     print(
-                        f"  predicted: {pred_col}{sproj_duty:.1f}% → {sproj_rtc:.1f}% by reset"
-                        f"   (optimistic: duty-weighted; if you sustain 24/7)"
-                        f"   (eff {eff_rate:.2f} pp/hr, prior={prior_s},"
-                        f" K={sr.k_used:.0f}h, wins={sr.prior_window_count})"
+                        f"  predicted: {pred_col}{sproj_duty_i}–{sproj_rtc_i}% at reset"
+                        f"{pred_detail}"
                         f"   {pred_glyph}{rst}"
                     )
 
                     # ── target line: pace/headroom (rate, not level) ──
                     # even_pace = (100 − current_pct) / h_to_reset
                     # "to land at 100%" means spend the remaining budget evenly.
-                    # Comparison: how many × are you over/under that pace?
+                    # Comparison: how many × over, or headroom % if under.
                     if h_to_reset == h_to_reset and h_to_reset > 0:
                         even_pace = pp_remaining / h_to_reset   # pp/hr needed to land at 100%
                         if even_pace > 0:
                             ratio = eff_rate / even_pace
                             if ratio >= 1.05:
-                                pace_verdict = f"→  {ratio:.1f}× over"
+                                pace_verdict = f"({ratio:.1f}× over)"
                                 target_col = _colour_for_pct(sproj_rtc)  # same urgency as predicted
                             elif ratio <= 0.95:
-                                pace_verdict = f"→  {ratio:.1f}× under"
+                                headroom_pct = (even_pace - eff_rate) / even_pace * 100
+                                pace_verdict = f"(~{headroom_pct:.0f}% headroom)"
                                 target_col = _colour_for_pct(0)  # green: under-pacing
                             else:
-                                pace_verdict = "→  on pace"
+                                pace_verdict = "(on pace)"
                                 target_col = _colour_for_pct(0)  # green: on pace
                         else:
                             pace_verdict = ""
                             target_col = ""
+                        you_label = f"you're ~{eff_rate:.2f}"
+                        if verbose:
+                            you_label += "  (eff_rate)"
                         print(
-                            f"  target:    {target_col}≤{even_pace:.2f} pp/hr from here to land at 100%"
-                            f"  ·  you're at {eff_rate:.2f}  {pace_verdict}{rst}"
+                            f"  target:    {target_col}≤{even_pace:.2f} pp/hr to stay on track"
+                            f"  ·  {you_label}  {pace_verdict}{rst}"
                         )
                     else:
                         print(f"  target:    n/a (no reset timestamp)")
@@ -1360,6 +1382,18 @@ Examples:
             "never = no colour.  Has no effect on --json or --autonomous-status."
         ),
     )
+    ap.add_argument(
+        "-c", dest="color", action="store_const", const="always",
+        help="Shorthand for --color=always.",
+    )
+
+    ap.add_argument(
+        "--verbose", action="store_true",
+        help=(
+            "Show internal projection details: effective rate, prior, K, wins, "
+            "active fraction, and caveats. Default (off) = clean one-liner per bucket."
+        ),
+    )
 
     ap.add_argument(
         "--test-5h-stability", action="store_true",
@@ -1446,7 +1480,7 @@ Examples:
         sys.exit(autonomous_status(con, cur, args.ceiling, parse_window(args.window),
                                    mode=args.mode, emit_json=args.json))
 
-    report(parse_window(args.window), con, cur, mode=args.mode)
+    report(parse_window(args.window), con, cur, mode=args.mode, verbose=args.verbose)
 
 
 if __name__ == "__main__":
