@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [1.0.7] — 2026-06-13
+
+### Changed
+
+**Statusline render (`render-rates.py`) — colour & layout polish**
+- Each bucket (`5h:`, `7d:`) now renders as a **single colour block** driven by the
+  projected value. Previously the current-% label and the `→NN%` projection were
+  coloured separately, so they mismatched (e.g. `7d:13%` green, `63%` blue).
+- The reset countdown is now inside the colour block **immediately before it**: the
+  5h countdown stays in the 5h block; the 7d countdown moves to the **end** of the
+  stanza (after `duty:`) and takes the duty colour.
+  New layout: `5h:16%→43% ⏳3h7m │ 7d:13%→63% │ duty:46.1% ⏳6d15h`.
+
+---
+
 ## [1.0.6] — 2026-06-13
 
 ### Added
