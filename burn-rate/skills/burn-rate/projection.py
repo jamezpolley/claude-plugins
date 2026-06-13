@@ -898,6 +898,11 @@ def _build_burn_histogram(
 
     Cells with no qualifying burn are absent from both dicts (treated as 0 by
     the caller).  sample_counts is used by the WS7 per-cell prior blend.
+
+    NOTE: When spans.py is available, prefer _build_burn_histogram_from_spans()
+    which uses cleaned readings (Wrinkles 0-3 + running-max hygiene) to avoid
+    personal-account contamination.  This legacy function is retained as a
+    fallback for the prior-bucket path and for backwards compatibility.
     """
     # Restrict to work-account windows for the duty profile (personal account
     # is a different quota scale and rhythm).
@@ -953,6 +958,147 @@ def _build_burn_histogram(
             # NOTE: a long interval spanning multiple cells is attributed to its
             # midpoint cell. With ~20-min snapshot cadence this is fine; if
             # cadence drops we'd want to split across cells. Revisit if gaps grow.
+            mid = t_prev + (t_curr - t_prev) / 2
+            how = _hour_of_week(mid)
+            hist[how] = hist.get(how, 0.0) + delta
+            sample_counts[how] = sample_counts.get(how, 0) + 1
+
+    return hist, sample_counts
+
+
+def _build_burn_histogram_from_spans(
+    conn: sqlite3.Connection,
+    bucket: str,
+    spans: list,   # list[spans.Span] — typed as list for import flexibility
+    de_ration: bool,
+) -> tuple[dict[int, float], dict[int, int]]:
+    """WS12: Build the burn histogram from cleaned span readings.
+
+    Same logic as _build_burn_histogram but feeds on the cleaned readings
+    produced by spans.py (Wrinkles 0–3 + running-max data hygiene) rather than
+    raw _fetch_all_snapshots().
+
+    Key correctness improvements over the legacy function:
+    1. Personal-account readings (S5 / Wrinkle 1) are excluded — they were being
+       pulled in by the timestamp-range filter since S5 timestamps overlap S4's
+       calendar window.  Now we filter by resets_at so only readings labelled with
+       a work-account reset are considered.
+    2. Running-max-per-generation is applied within each span's reading window,
+       eliminating the cross-source ±1 jitter and stale late-arriving label gotchas
+       documented in "Data hygiene gotchas — raw readings".
+    3. Censoring (Wrinkle 3) is correctly applied: each span knows its own
+       end_ts (cap instant for censored spans) rather than relying on the window's
+       peak_pct heuristic.
+
+    Parameters match _build_burn_histogram so the caller (duty_surface) can
+    swap them transparently.  Returns the same (hist, sample_counts) shape.
+    """
+    from spans import Span as _SpanType  # local import to avoid circular
+
+    # Work-account spans only; discard personal, in-progress, and thin spans
+    # for the shape (we want the WHEN profile to reflect real work rhythm).
+    # For the histogram, in-progress spans ARE included — they show current-week
+    # activity and contribute to the WHEN shape even if excluded from the prior.
+    work_spans = [s for s in spans if s.exclude_reason not in ('personal', 'thin')]
+    if not work_spans:
+        return {}, {}
+
+    # Fetch all non-garbage readings once, keyed by (canonical resets_at, ts).
+    # We only include readings whose resets_at maps to a work-account generation.
+    # This is the key fix: filtering by resets_at (not just timestamp) ensures
+    # personal-account readings (which carry a different resets_at label) are
+    # excluded even when their timestamps overlap a work-account time window.
+
+    # Build set of canonical resets_at values for work spans
+    # (use .strftime to match against DB string format)
+    work_resets_ats_dt = {s.resets_at for s in work_spans}
+
+    # Also build the canonical_map from raw labels to datetime (for matching)
+    from spans import _canonicalise_resets_at as _canon_fn, _parse as _spans_parse
+
+    raw_rows = conn.execute(
+        "SELECT snapshot_ts, pct_used, resets_at FROM quota_snapshots "
+        "WHERE bucket=? ORDER BY snapshot_ts ASC",
+        (bucket,),
+    ).fetchall()
+
+    # Filter garbage and build canonical map for all raw resets_at in DB
+    from spans import GARBAGE_RESETS as _SPANS_GARBAGE
+    raw_rows = [(ts, pct, ra) for ts, pct, ra in raw_rows if ra not in _SPANS_GARBAGE]
+    if not raw_rows:
+        return {}, {}
+
+    raw_labels = list({ra for _, _, ra in raw_rows})
+    canon_map = _canon_fn(raw_labels)  # raw_label -> canonical datetime
+
+    # Group readings by canonical resets_at datetime
+    gen_readings: dict[datetime, list[tuple[datetime, float]]] = {}
+    for ts_s, pct, ra_s in raw_rows:
+        canon_dt = canon_map.get(ra_s)
+        if canon_dt is None:
+            continue
+        # Only include readings from work-account generations (Wrinkle 1 filter)
+        if canon_dt not in work_resets_ats_dt:
+            continue
+        try:
+            ts_dt = _spans_parse(ts_s)
+        except (ValueError, OverflowError):
+            continue
+        gen_readings.setdefault(canon_dt, []).append((ts_dt, pct))
+
+    for canon_dt in gen_readings:
+        gen_readings[canon_dt].sort(key=lambda x: x[0])
+
+    # Build a lookup: span -> (sub_start, sub_end, is_censored)
+    # Each span has its own sub-start/end (respects Wrinkle-2 splits and
+    # Wrinkle-3 cap instants); we process readings within each span's boundary.
+
+    hist: dict[int, float] = {}
+    sample_counts: dict[int, int] = {}
+
+    for span in work_spans:
+        # Readings from this span's generation only
+        raw_readings = gen_readings.get(span.resets_at, [])
+        if not raw_readings:
+            continue
+
+        # Collect readings within this span's time window
+        sub_raw = [
+            (ts, pct) for ts, pct in raw_readings
+            if span.start_ts <= ts <= span.end_ts
+        ]
+        if not sub_raw:
+            continue
+
+        # Apply running-max (data hygiene: cross-source jitter + stale arrivals)
+        from spans import _running_max_readings
+        sub_clean = _running_max_readings(sub_raw)
+
+        for i in range(1, len(sub_clean)):
+            t_prev, pct_prev = sub_clean[i - 1]
+            t_curr, pct_curr = sub_clean[i]
+            gap_h = (t_curr - t_prev).total_seconds() / 3600.0
+            if gap_h <= 0:
+                continue
+            delta = pct_curr - pct_prev
+            if delta <= 0:
+                continue  # flat or reset — not burn (running-max means all deltas ≥ 0)
+            # Hygiene: reset/account-switch jump
+            if delta > JUMP_DELTA_PP and gap_h < JUMP_MAX_GAP_H:
+                continue
+            rate = delta / gap_h
+            # Idle floor
+            if rate < IDLE_FLOOR_PP_H:
+                continue
+
+            # De-rationing exclusions for the target (natural) surface
+            if de_ration:
+                if pct_prev >= RATIONING_PCT_THRESHOLD:
+                    continue
+                # Use span.is_censored (correctly identifies cap from Wrinkle 3)
+                if span.is_censored:
+                    continue
+
             mid = t_prev + (t_curr - t_prev) / 2
             how = _hour_of_week(mid)
             hist[how] = hist.get(how, 0.0) + delta
@@ -1154,9 +1300,21 @@ def duty_surface(
         else:
             reset_dt = now + timedelta(days=7)
 
-    windows = _extract_windows(conn, bucket, now)
     de_ration = (surface_kind == 'natural')
-    hist, sample_counts = _build_burn_histogram(conn, bucket, windows, de_ration=de_ration)
+
+    # WS12: Use span-cleaned readings when spans.py is available.
+    # This eliminates personal-account contamination (S5 readings bleed into
+    # S4's calendar window) and applies running-max data hygiene.
+    # Falls back to the legacy _extract_windows path when spans.py is absent.
+    if _SPANS_AVAILABLE:
+        spans = _spans_extract(conn, bucket, now)
+        hist, sample_counts = _build_burn_histogram_from_spans(
+            conn, bucket, spans, de_ration=de_ration
+        )
+    else:
+        windows = _extract_windows(conn, bucket, now)
+        hist, sample_counts = _build_burn_histogram(conn, bucket, windows, de_ration=de_ration)
+
     if de_ration:
         hist = _impute_natural_cells(hist)
 
@@ -1172,10 +1330,17 @@ def duty_surface(
     effective_prior_bucket = prior_bucket if prior_bucket else bucket
     if effective_prior_bucket != bucket:
         # Fetch and normalise the prior bucket's histogram.
-        prior_windows = _extract_windows(conn, effective_prior_bucket, now)
-        prior_hist, _prior_counts = _build_burn_histogram(
-            conn, effective_prior_bucket, prior_windows, de_ration=de_ration
-        )
+        # WS12: use span-cleaned path for the prior bucket too.
+        if _SPANS_AVAILABLE:
+            prior_spans = _spans_extract(conn, effective_prior_bucket, now)
+            prior_hist, _prior_counts = _build_burn_histogram_from_spans(
+                conn, effective_prior_bucket, prior_spans, de_ration=de_ration
+            )
+        else:
+            prior_windows = _extract_windows(conn, effective_prior_bucket, now)
+            prior_hist, _prior_counts = _build_burn_histogram(
+                conn, effective_prior_bucket, prior_windows, de_ration=de_ration
+            )
         if de_ration:
             prior_hist = _impute_natural_cells(prior_hist)
         prior_weights = _histogram_to_weights(prior_hist)
