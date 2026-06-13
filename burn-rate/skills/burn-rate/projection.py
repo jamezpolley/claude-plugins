@@ -66,6 +66,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+# Phase A (WS10/WS11/epoch-fix): import clean span extraction and pooled prior.
+# spans.py lives alongside this file; import lazily to avoid circular deps.
+try:
+    from spans import (
+        extract_spans as _spans_extract,
+        get_effective_epoch as _spans_get_epoch,
+        pooled_prior as _spans_pooled_prior,
+        Span as _Span,
+    )
+    _SPANS_AVAILABLE = True
+except ImportError:
+    _SPANS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -682,37 +695,68 @@ def compute_prior(
 ) -> tuple[float, list[QuotaWindow]]:
     """Compute the span-correct, recency-weighted historical prior for `bucket`.
 
+    Phase A (WS10/WS11): delegates to spans.py when available for the correct
+    pooled-prior calculation.  Falls back to the legacy _extract_windows path
+    when spans.py is not importable (e.g., during a transition period).
+
     Returns (prior_pp_per_hour, list_of_windows_used).
 
-    Algorithm:
-    1. Extract all real quota windows.
-    2. Filter to work-account, completed windows only.
-    3. Use each window's actual data span (not assumed 168h).
-    4. Right-censored windows (hit ~100%) contribute their observed rate as a
-       lower bound — included directly (their rate is >= true rate). Safe
-       (understates), and K damps early-week spikes regardless.
-    5. Apply the recency policy (_select_windows_by_recency): equal-weight while
-       thin, rolling-window + exponential decay once mature.
-    6. Prior = recency-weighted mean of window rates.
-
-    `now` is injectable for deterministic testing (decay is computed relative
-    to it). Defaults to wall-clock now.
+    The returned list is typed as list[QuotaWindow] for API compatibility; when
+    the spans path is used, the objects are actually spans._Span instances but
+    they expose compatible attributes (start_ts, end_ts, end_pct, rate_pp_h,
+    is_censored, is_completed).
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    windows = _extract_windows(conn, bucket, now)
 
-    # Filter to: work account + completed only
+    if _SPANS_AVAILABLE:
+        # Phase A path: use canonical span extraction + WS11 pooled prior
+        spans = _spans_extract(conn, bucket, now)
+        eligible = [s for s in spans if s.prior_eligible]
+
+        if not eligible:
+            return 0.7, []
+
+        # Recency weight function (mirrors legacy recency policy).
+        # THIN (<=5 spans): equal weight; MATURE (>=8): rolling+decay.
+        # For now, delegate to the same _select_windows_by_recency logic but
+        # operating on spans.  We adapt by building QuotaWindow proxies so we
+        # can reuse the existing recency machinery without duplicating it.
+        proxy_windows = [
+            QuotaWindow(
+                bucket=bucket,
+                start_ts=s.start_ts,
+                end_ts=s.end_ts,
+                start_pct=0.0,
+                end_pct=s.delta_pp,
+                actual_span_h=s.span_h,
+                rate_pp_h=s.rate_pp_h,
+                is_work_account=True,   # eligible already filters personal
+                is_censored=s.is_censored,
+                is_completed=True,
+                source='spans_py',
+            )
+            for s in eligible
+        ]
+        weighted_pairs, _ = _select_windows_by_recency(proxy_windows, now)
+
+        # WS11: pooled prior — Σ(w·Δpp) / Σ(w·hours) NOT mean-of-rates
+        sum_w_pp = sum(wt * w.end_pct for w, wt in weighted_pairs)
+        sum_w_h = sum(wt * w.actual_span_h for w, wt in weighted_pairs)
+        prior = sum_w_pp / sum_w_h if sum_w_h > 0 else 0.7
+
+        return prior, [w for w, _ in weighted_pairs]
+
+    # Legacy fallback path (spans.py not available)
+    windows = _extract_windows(conn, bucket, now)
     work_completed = [
         w for w in windows
         if w.is_work_account and w.is_completed and w.rate_pp_h >= 0
     ]
-
     if not work_completed:
-        # No clean work windows — fall back to all completed windows (any account).
         all_completed = [w for w in windows if w.is_completed and w.rate_pp_h >= 0]
         if not all_completed:
-            return 0.7, []  # absolute fallback: conservative ~0.7 pp/hr default
+            return 0.7, []
         weighted, _ = _select_windows_by_recency(all_completed, now)
         prior = _weighted_mean(weighted)
         return prior, [w for w, _ in weighted]
@@ -723,7 +767,11 @@ def compute_prior(
 
 
 def _weighted_mean(weighted: list[tuple[QuotaWindow, float]]) -> float:
-    """Recency-weighted mean of window rates."""
+    """Legacy recency-weighted mean of window rates (averaging-averages).
+
+    Retained as a fallback for the legacy _extract_windows path.
+    The WS11 fix (pooled prior) is in compute_prior's spans.py branch.
+    """
     if not weighted:
         return 0.7
     total_w = sum(wt for _, wt in weighted)
@@ -1171,24 +1219,34 @@ def duty_surface(
 # ---------------------------------------------------------------------------
 
 def _get_effective_reset_epoch(conn: sqlite3.Connection, bucket: str,
-                               resets_at_dt: datetime) -> datetime:
+                               resets_at_dt: datetime,
+                               now: Optional[datetime] = None) -> datetime:
     """Return the effective start of the current quota window.
 
-    Prefers reset_history, falls back to monotonicity-break detection,
-    then to resets_at - 7 days.
+    Phase A stale-epoch fix (WS10):
+      epoch = max([history boundaries ≤ now] + [resets_at − 7d])
+
+    The presumed weekly boundary (resets_at − 7d) is a PEER candidate in the
+    max(), not just a fallback.  The old code returned max(history ≤ now) and
+    only used resets_at−7d if history was empty — so the Jun-09 21:30 history
+    entry was reported as the epoch even though the current week started
+    Jun-13 00:00 (resets_at_dt − 7d = Jun-20 − 7d = Jun-13).
+
+    Delegates to spans.get_effective_epoch() when spans.py is available.
     """
-    # Check reset_history first
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    if _SPANS_AVAILABLE:
+        return _spans_get_epoch(conn, bucket, resets_at_dt, now)
+
+    # Fallback (spans.py not importable): replicate the fix inline
     _ensure_reset_history(conn)
     history = _get_reset_history_boundaries(conn, bucket)
-    if history:
-        # The most recent boundary before now is the start of the current window
-        now = datetime.now(timezone.utc)
-        recent = [b for b in history if b <= now]
-        if recent:
-            return max(recent)
-
-    # Fall back to resets_at - 7 days
-    return resets_at_dt - timedelta(days=7)
+    recent = [b for b in history if b <= now]
+    weekly_boundary = resets_at_dt - timedelta(days=7)
+    candidates = recent + [weekly_boundary]
+    return max(candidates)
 
 
 def _get_latest_snapshot(conn: sqlite3.Connection, bucket: str) -> Optional[tuple[str, float, str]]:
@@ -1293,8 +1351,8 @@ def project(
         # Existing burn_rate.py logic: derived epoch = resets_at - 7 days
         epoch_dt = reset_dt - timedelta(days=7)
     else:
-        # Use reset_history if available, else monotonicity-break detection
-        epoch_dt = _get_effective_reset_epoch(conn, bucket, reset_dt)
+        # Phase A: use epoch fix (history-boundary + weekly-boundary peer max)
+        epoch_dt = _get_effective_reset_epoch(conn, bucket, reset_dt, now)
         notes.append(f"Reset epoch: {epoch_dt.isoformat()}")
 
     elapsed_h = (now - epoch_dt).total_seconds() / 3600.0
