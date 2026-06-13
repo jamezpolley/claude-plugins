@@ -825,35 +825,12 @@ def main():
 
     write_statusline_sentinel()
 
-    # ── Sonnet-weekly quota capture via `claude -p /usage` ───────────────────
-    # Throttled separately (30 min) because spawning a full Claude subprocess
-    # is expensive.  The LOG_USAGE_INNER sentinel prevents recursion.
-    usage_cli_throttle_file = STATE_DIR / "log-usage-cli.txt"
-    cli_throttled = False
-    try:
-        if usage_cli_throttle_file.exists():
-            last_cli_run = float(usage_cli_throttle_file.read_text().strip())
-            if now_ts - last_cli_run < USAGE_CLI_THROTTLE_SECONDS:
-                cli_throttled = True
-    except Exception:
-        pass
-
-    if not cli_throttled:
-        try:
-            now_iso_cli = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            conn_cli = sqlite3.connect(str(DB_PATH))
-            try:
-                snapshot_from_usage_cli(conn_cli, now_iso_cli)
-                conn_cli.commit()
-            finally:
-                conn_cli.close()
-        except Exception:
-            pass
-        try:
-            usage_cli_throttle_file.write_text(str(now_ts))
-        except Exception:
-            pass
-    # ─────────────────────────────────────────────────────────────────────────
+    # Sonnet-weekly quota capture is handled by quota-snapshot.timer
+    # (quota-snapshot-poll.py, every 20 min round-the-clock, `claude --model
+    # haiku -p /usage`).  WS1 (2026-06-13) removed the redundant in-hook /usage
+    # capture so there is a single sonnet gap-filler.  snapshot_from_usage_cli()
+    # and USAGE_CLI_THROTTLE_SECONDS are retained (unused here) for a possible
+    # manual-capture path later.
 
     try:
         throttle_file.write_text(str(now_ts))
