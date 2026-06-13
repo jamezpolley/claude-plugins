@@ -1,11 +1,17 @@
 {
   "name": "burn-rate",
-  "version": "1.0.5",
-  "description": "Claude Code quota burn-rate reporting — % used, pp/hr, projected exhaustion of weekly buckets from the statusline-populated SQLite at ~/.claude/state/usage-log.sqlite",
+  "version": "1.0.6",
+  "description": "Claude Code quota burn-rate reporting \u2014 % used, pp/hr, projected exhaustion of weekly buckets from the statusline-populated SQLite at ~/.claude/state/usage-log.sqlite",
   "author": {
     "name": "James Polley",
     "email": "jamezpolley@gmail.com"
   },
   "license": "MIT",
-  "keywords": ["quota", "usage", "burn-rate", "claude-code", "statusline"]
+  "keywords": [
+    "quota",
+    "usage",
+    "burn-rate",
+    "claude-code",
+    "statusline"
+  ]
 }
