@@ -792,50 +792,61 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
                 )
 
             if shrink_result is not None:
-                # Shrinkage projection available — show both raw and shrinkage
+                # ── WS14 two-line report: predicted (level) + target (pace) ──
                 sr = shrink_result
-                mode_label = f"[{mode}]"
+                eff_rate = sr.effective_rate_pp_h
+                sproj_duty = sr.duty_projected_pct       # duty-adjusted best estimate
+                prior_s = f"{sr.prior_pp_h:.3f}" if sr.prior_pp_h is not None else "n/a"
+
                 if primary_pp_h <= 0:
-                    print(f"  ETA:       not increasing — no exhaustion projected")
+                    print(f"  predicted: not increasing — no exhaustion projected")
+                    print(f"  target:    n/a (zero rate)")
                 else:
-                    # Naive ETA for context
                     pp_remaining = 100.0 - pct
-                    hrs_to_100_naive = pp_remaining / primary_pp_h
-                    # Shrinkage-projected % at reset (round-the-clock)
-                    sproj = sr.projected_pct_at_reset
-                    sproj_duty = sr.duty_projected_pct
-                    prior_s = f"{sr.prior_pp_h:.3f}" if sr.prior_pp_h is not None else "n/a"
-                    print(
-                        f"  projection {mode_label}:  "
-                        f"rtc={sproj:.1f}%   duty={sproj_duty:.1f}%  "
-                        f"(eff_rate={sr.effective_rate_pp_h:.3f} pp/hr  "
-                        f"prior={prior_s} pp/hr  K={sr.k_used:.0f}h  "
-                        f"windows={sr.prior_window_count})"
-                    )
-                    # Show ETA using shrinkage-effective rate (more honest)
-                    eff_rate = sr.effective_rate_pp_h
-                    if eff_rate > 0:
-                        hrs_to_100_eff = pp_remaining / eff_rate
-                        exhaust_at_eff = now + timedelta(hours=hrs_to_100_eff)
-                        if resets and exhaust_at_eff < parse_iso(resets):
-                            margin_h = (parse_iso(resets) - exhaust_at_eff).total_seconds() / 3600.0
-                            print(f"  ETA:       100% in {fmt_h(hrs_to_100_eff)} "
-                                  f"(at {exhaust_at_eff.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
-                                  f"⚠ BEFORE reset by {fmt_h(margin_h)}")
-                        else:
-                            print(f"  ETA:       {sproj:.1f}% by reset  (no exhaustion at this rate)")
+
+                    # ── predicted line: duty-adjusted level + glyph escalation ──
+                    # Glyph mirrors the bucket value's escalation rule:
+                    #   ≥100%          → ⚠ over ceiling
+                    #   ≥80%  (<100%)  → ⚠ caution
+                    #   else           → ✓ on track
+                    if sproj_duty >= 100.0:
+                        pred_glyph = "⚠ over ceiling"
+                    elif sproj_duty >= 80.0:
+                        pred_glyph = "⚠ caution"
                     else:
-                        print(f"  ETA:       not increasing — no exhaustion projected")
-                    # Duty line using shrinkage duty projection
-                    if resets:
-                        reset_utc = parse_iso(resets)
-                        # Use shrinkage effective rate for duty exhaustion search
-                        dc_pct_at_reset_eff, dc_exhaust_eff = duty_cycle_eta(
-                            now, pct, eff_rate, reset_utc
+                        pred_glyph = "✓ on track"
+
+                    # Parenthetical folds in what the old `projection [mode]:` line had:
+                    # eff_rate, prior, K, windows — rtc demoted to debug (not shown).
+                    print(
+                        f"  predicted: {sproj_duty:.1f}% by reset"
+                        f"   (eff {eff_rate:.2f} pp/hr, duty-weighted,"
+                        f" prior={prior_s}, K={sr.k_used:.0f}h, wins={sr.prior_window_count})"
+                        f"   {pred_glyph}"
+                    )
+
+                    # ── target line: pace/headroom (rate, not level) ──
+                    # even_pace = (100 − current_pct) / h_to_reset
+                    # "to land at 100%" means spend the remaining budget evenly.
+                    # Comparison: how many × are you over/under that pace?
+                    if h_to_reset == h_to_reset and h_to_reset > 0:
+                        even_pace = pp_remaining / h_to_reset   # pp/hr needed to land at 100%
+                        if even_pace > 0:
+                            ratio = eff_rate / even_pace
+                            if ratio >= 1.05:
+                                pace_verdict = f"→  {ratio:.1f}× over"
+                            elif ratio <= 0.95:
+                                pace_verdict = f"→  {ratio:.1f}× under"
+                            else:
+                                pace_verdict = "→  on pace"
+                        else:
+                            pace_verdict = ""
+                        print(
+                            f"  target:    ≤{even_pace:.2f} pp/hr from here to land at 100%"
+                            f"  ·  you're at {eff_rate:.2f}  {pace_verdict}"
                         )
-                        # Override the pct_at_reset with the shrinkage duty projection
-                        # (more accurate — uses empirical 07-24 UTC active hours)
-                        print(fmt_duty_line(sproj_duty, dc_exhaust_eff, now, reset_utc))
+                    else:
+                        print(f"  target:    n/a (no reset timestamp)")
             else:
                 # Naive mode (or projection unavailable): existing logic verbatim
                 if primary_pp_h <= 0:
