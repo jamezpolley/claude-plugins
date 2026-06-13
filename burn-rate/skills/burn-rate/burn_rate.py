@@ -684,6 +684,91 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor):
         print()
 
 
+def autonomous_status(con, cur, ceiling: float, window: timedelta) -> int:
+    """Compact, parseable self-regulation status for autonomous runs.
+
+    Gates (James's rule): keep each weekly bucket's projected-%-at-reset under
+    `ceiling` (default 80%) so there's always end-of-week headroom, AND keep
+    recent burn under the rate that sustains that ceiling (the prior
+    sustainable-budget guideline). Round-the-clock projection is the primary
+    gate — an autonomous bot burns continuously, so rtc is the honest model;
+    duty is shown as secondary context.
+
+    Emits one line per bucket plus a single `VERDICT: GO|CAUTION|STOP`.
+    Returns 0/1/2 (GO/CAUTION/STOP) as the process exit code so callers can
+    branch on it without parsing.
+    """
+    now = datetime.now(timezone.utc)
+    print(f"AUTONOMOUS STATUS  ceiling={ceiling:.0f}%  "
+          f"({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
+
+    # Bucket set: rolling 5h + the freshest weekly per display label.
+    rows: list[tuple[str, str, tuple, timedelta]] = []
+    fh = latest_for_bucket(cur, FIVE_HOUR_BUCKET)
+    if fh is not None:
+        rows.append(("5h", FIVE_HOUR_BUCKET, fh, FIVE_HOUR_CYCLE))
+    by_label: dict[str, tuple[str, tuple]] = {}
+    for bucket in WEEKLY_BUCKETS:
+        latest = latest_for_bucket(cur, bucket)
+        if latest is None:
+            continue
+        label = DISPLAY[bucket]
+        if label not in by_label or latest[0] > by_label[label][1][0]:
+            by_label[label] = (bucket, latest)
+    for label, (bucket, latest) in by_label.items():
+        tag = "7d" if "All Models" in label else "sonnet"
+        rows.append((tag, bucket, latest, timedelta(days=7)))
+
+    worst = 0
+    reasons: list[str] = []
+    for tag, bucket, latest, cycle in rows:
+        ts, pct, resets = latest
+        if not resets:
+            print(f"  {tag:6s} cur={pct:.1f}%  (no reset timestamp — skipped)")
+            continue
+        h_to_reset = hours_until(resets)
+        prev_reset_dt = parse_iso(resets) - cycle
+        elapsed_h = (now - prev_reset_dt).total_seconds() / 3600.0
+        pp_h = pct / elapsed_h if elapsed_h > 0 else 0.0
+        proj_raw = pct + pp_h * h_to_reset if h_to_reset == h_to_reset else pct
+        proj_duty, _ = duty_cycle_eta(now, pct, pp_h, parse_iso(resets))
+        budget = ((ceiling - pct) / h_to_reset
+                  if (h_to_reset == h_to_reset and h_to_reset > 0) else 0.0)
+        r = rate_for_bucket(cur, bucket, window, resets, cycle=cycle)
+        recent = r[0] if r else float("nan")
+
+        over_now = pct >= ceiling
+        proj_over = proj_raw >= ceiling
+        recent_hot = (recent == recent) and (recent > budget)
+        if over_now or (proj_over and recent_hot):
+            state, lvl = "STOP", 2
+        elif proj_over or recent_hot:
+            state, lvl = "CAUTION", 1
+        else:
+            state, lvl = "GO", 0
+        worst = max(worst, lvl)
+        if lvl > 0:
+            if over_now:
+                reasons.append(f"{tag} already {pct:.0f}% ≥ {ceiling:.0f}%")
+            elif proj_over:
+                reasons.append(f"{tag} projected {proj_raw:.0f}% ≥ {ceiling:.0f}%")
+            if recent_hot:
+                reasons.append(f"{tag} recent {recent:.2f} > budget {budget:.2f} pp/hr")
+
+        recent_str = f"{recent:.2f}" if recent == recent else "—"
+        budget_str = f"{budget:.2f}" if budget == budget else "—"
+        duty_str = f"{proj_duty:.0f}" if proj_duty is not None else "—"
+        print(f"  {tag:6s} cur={pct:.1f}%  proj={proj_raw:.0f}%(rtc)/{duty_str}%(duty)  "
+              f"budget={budget_str}pp/hr  recent={recent_str}pp/hr  → {state}")
+
+    verdict = ("GO", "CAUTION", "STOP")[worst]
+    if reasons:
+        print(f"VERDICT: {verdict}  ({'; '.join(reasons)})")
+    else:
+        print(f"VERDICT: {verdict}  (all buckets projected under {ceiling:.0f}% and within budget)")
+    return worst
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Report Claude Code quota burn rate and projected exhaustion.",
@@ -700,6 +785,15 @@ Examples:
     ap.add_argument(
         "--window", default="6h",
         help="Lookback window for burn rate comparison (e.g. 1h, 6h, 24h, 3d). Default 6h.",
+    )
+    ap.add_argument(
+        "--autonomous-status", action="store_true",
+        help="Compact self-regulation verdict (GO/CAUTION/STOP) for autonomous runs; "
+             "gates each weekly bucket's projected-%-at-reset under --ceiling. Exit code = 0/1/2.",
+    )
+    ap.add_argument(
+        "--ceiling", type=float, default=80.0,
+        help="Projected-%-at-reset ceiling for --autonomous-status (default 80).",
     )
 
     override_group = ap.add_mutually_exclusive_group()
@@ -757,6 +851,10 @@ Examples:
             for bucket, reset_ts, created_ts in rows:
                 print(f"  {bucket:20s}  reset_ts={reset_ts}  created={created_ts}")
         return
+
+    if args.autonomous_status:
+        import sys as _sys
+        _sys.exit(autonomous_status(con, cur, args.ceiling, parse_window(args.window)))
 
     report(parse_window(args.window), con, cur)
 

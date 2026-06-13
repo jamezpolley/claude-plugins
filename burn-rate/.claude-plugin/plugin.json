@@ -1,6 +1,6 @@
 {
   "name": "burn-rate",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Claude Code quota burn-rate reporting — % used, pp/hr, projected exhaustion of weekly buckets from the statusline-populated SQLite at ~/.claude/state/usage-log.sqlite",
   "author": {
     "name": "James Polley",
