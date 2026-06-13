@@ -65,6 +65,7 @@ Overrides are stored in a `reset_overrides` table in the same SQLite DB:
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -880,7 +881,7 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
 
 
 def autonomous_status(con, cur, ceiling: float, window: timedelta,
-                      mode: str = "predictive") -> int:
+                      mode: str = "predictive", emit_json: bool = False) -> int:
     """Compact, parseable self-regulation status for autonomous runs.
 
     Gates (James's rule): keep each weekly bucket's projected-%-at-reset under
@@ -896,14 +897,20 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta,
     is preserved: shrinkage only replaces the projection signal, not the
     recent-rate check.
 
-    Emits one line per bucket plus a single `VERDICT: GO|CAUTION|STOP`.
+    Emits one line per bucket plus a single `VERDICT: GO|CAUTION|STOP` (human
+    text, default).  When `emit_json` is True, emits structured JSON instead.
+
+    The exit code (0=GO, 1=CAUTION, 2=STOP) is the decision contract in both
+    modes — it is never altered by --json.
+
     Returns 0/1/2 (GO/CAUTION/STOP) as the process exit code so callers can
     branch on it without parsing.
     """
     now = datetime.now(timezone.utc)
     mode_label = f"[{mode}]" if mode != "naive" else "[naive]"
-    print(f"AUTONOMOUS STATUS  ceiling={ceiling:.0f}%  mode={mode}  "
-          f"({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
+    if not emit_json:
+        print(f"AUTONOMOUS STATUS  ceiling={ceiling:.0f}%  mode={mode}  "
+              f"({now.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})")
 
     # Bucket set: rolling 5h + the freshest weekly per display label.
     rows: list[tuple[str, str, tuple, timedelta]] = []
@@ -924,10 +931,13 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta,
 
     worst = 0
     reasons: list[str] = []
+    json_buckets: list[dict] = []
+
     for tag, bucket, latest, cycle in rows:
         ts, pct, resets = latest
         if not resets:
-            print(f"  {tag:6s} cur={pct:.1f}%  (no reset timestamp — skipped)")
+            if not emit_json:
+                print(f"  {tag:6s} cur={pct:.1f}%  (no reset timestamp — skipped)")
             continue
         h_to_reset = hours_until(resets)
 
@@ -949,6 +959,10 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta,
         proj_raw = proj_raw_naive  # default: naive
         proj_duty = proj_duty_naive
         shrink_note = ""
+        eff_rate: float | None = None
+        prior_pp_h: float | None = None
+        k_used: float | None = None
+        window_count: int | None = None
 
         if mode != "naive" and tag != "5h" and _PROJECTION_AVAILABLE:
             # Wire active override so shrinkage uses the correct window epoch
@@ -959,6 +973,10 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta,
             if sr is not None:
                 proj_raw = sr.projected_pct_at_reset
                 proj_duty = sr.duty_projected_pct
+                eff_rate = sr.effective_rate_pp_h
+                prior_pp_h = sr.prior_pp_h
+                k_used = sr.k_used
+                window_count = sr.prior_window_count
                 prior_s = f"{sr.prior_pp_h:.3f}" if sr.prior_pp_h is not None else "?"
                 shrink_note = (
                     f"  shrinkage: eff={sr.effective_rate_pp_h:.3f}pp/hr  "
@@ -986,19 +1004,57 @@ def autonomous_status(con, cur, ceiling: float, window: timedelta,
             if recent_hot:
                 reasons.append(f"{tag} recent {recent:.2f} > budget {budget:.2f} pp/hr")
 
-        recent_str = f"{recent:.2f}" if recent == recent else "—"
-        budget_str = f"{budget:.2f}" if budget == budget else "—"
-        duty_str = f"{proj_duty:.0f}" if proj_duty is not None else "—"
-        print(f"  {tag:6s} cur={pct:.1f}%  proj={proj_raw:.0f}%(rtc)/{duty_str}%(duty)  "
-              f"budget={budget_str}pp/hr  recent={recent_str}pp/hr  → {state}")
-        if shrink_note:
-            print(shrink_note)
+        if emit_json:
+            # Collect per-bucket fields for JSON output; NaN → null
+            def _f(v):
+                """Coerce float; NaN and None → None (JSON null)."""
+                if v is None:
+                    return None
+                try:
+                    return None if v != v else float(v)  # NaN check
+                except (TypeError, ValueError):
+                    return None
+
+            json_buckets.append({
+                "name": tag,
+                "bucket": bucket,
+                "current_pct": _f(pct),
+                "proj_rtc_pct": _f(proj_raw),
+                "proj_duty_pct": _f(proj_duty),
+                "budget_rate_pp_h": _f(budget),
+                "recent_rate_pp_h": _f(recent),
+                "eff_rate_pp_h": _f(eff_rate),
+                "prior_pp_h": _f(prior_pp_h),
+                "k_used_h": _f(k_used),
+                "window_count": window_count,
+                "verdict": state,
+            })
+        else:
+            recent_str = f"{recent:.2f}" if recent == recent else "—"
+            budget_str = f"{budget:.2f}" if budget == budget else "—"
+            duty_str = f"{proj_duty:.0f}" if proj_duty is not None else "—"
+            print(f"  {tag:6s} cur={pct:.1f}%  proj={proj_raw:.0f}%(rtc)/{duty_str}%(duty)  "
+                  f"budget={budget_str}pp/hr  recent={recent_str}pp/hr  → {state}")
+            if shrink_note:
+                print(shrink_note)
 
     verdict = ("GO", "CAUTION", "STOP")[worst]
-    if reasons:
-        print(f"VERDICT: {verdict}  ({'; '.join(reasons)})")
+
+    if emit_json:
+        payload = {
+            "ceiling_pct": ceiling,
+            "mode": mode,
+            "timestamp_utc": now.isoformat().replace("+00:00", "Z"),
+            "buckets": json_buckets,
+            "reasons": reasons,
+            "VERDICT": verdict,
+        }
+        print(json.dumps(payload, indent=2))
     else:
-        print(f"VERDICT: {verdict}  (all buckets projected under {ceiling:.0f}% and within budget)")
+        if reasons:
+            print(f"VERDICT: {verdict}  ({'; '.join(reasons)})")
+        else:
+            print(f"VERDICT: {verdict}  (all buckets projected under {ceiling:.0f}% and within budget)")
     return worst
 
 
@@ -1014,6 +1070,7 @@ Examples:
   python burn_rate.py --mode predictive                  # Bayesian shrinkage (default)
   python burn_rate.py --mode target                      # even-pace prescriptive projection
   python burn_rate.py --autonomous-status                # compact GO/CAUTION/STOP verdict
+  python burn_rate.py --autonomous-status --json         # same verdict as structured JSON
   python burn_rate.py --autonomous-status --mode naive   # gate using naive projection
   python burn_rate.py --set-reset-override seven_day 2026-06-09T21:17:03Z
   python burn_rate.py --clear-reset-override seven_day
@@ -1041,6 +1098,12 @@ Examples:
     ap.add_argument(
         "--ceiling", type=float, default=80.0,
         help="Projected-%-at-reset ceiling for --autonomous-status (default 80).",
+    )
+    ap.add_argument(
+        "--json", action="store_true",
+        help="With --autonomous-status: emit structured JSON to stdout instead of human text. "
+             "The exit code (0=GO, 1=CAUTION, 2=STOP) is unchanged — it remains the decision "
+             "contract. Human text is the default when --json is absent.",
     )
 
     override_group = ap.add_mutually_exclusive_group()
@@ -1101,7 +1164,7 @@ Examples:
 
     if args.autonomous_status:
         sys.exit(autonomous_status(con, cur, args.ceiling, parse_window(args.window),
-                                   mode=args.mode))
+                                   mode=args.mode, emit_json=args.json))
 
     report(parse_window(args.window), con, cur, mode=args.mode)
 
