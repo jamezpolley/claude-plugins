@@ -73,6 +73,42 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
+# ANSI colour helpers — mirrors the ramp in render-rates.py exactly.
+# Controlled by the --color flag; never leaks into --json or --autonomous-status.
+# ---------------------------------------------------------------------------
+
+# Same 256-colour ramp as render-rates.py / statusline-command.sh rate_colour()
+_COLOUR_RAMP = [
+    (100, "\x1b[38;5;196m"),  # bright red  ≥100
+    (90,  "\x1b[38;5;160m"),  # red         ≥90
+    (80,  "\x1b[38;5;202m"),  # orange-red  ≥80
+    (70,  "\x1b[38;5;214m"),  # amber       ≥70
+    (55,  "\x1b[38;5;75m"),   # blue        ≥55
+    (40,  "\x1b[38;5;117m"),  # light blue  ≥40
+    (0,   "\x1b[38;5;151m"),  # pale green  comfortable
+]
+_RESET = "\x1b[0m"
+
+# Module-level flag; set once in main() based on --color arg.
+_COLOUR_ENABLED: bool = False
+
+
+def _colour_for_pct(pct: float) -> str:
+    """Return the ANSI colour code for a given percentage, matching the statusline ramp."""
+    if not _COLOUR_ENABLED:
+        return ""
+    pct_i = int(round(pct))
+    for threshold, code in _COLOUR_RAMP:
+        if pct_i >= threshold:
+            return code
+    return _COLOUR_RAMP[-1][1]
+
+
+def _reset() -> str:
+    """Return ANSI reset if colour is enabled, else empty string."""
+    return _RESET if _COLOUR_ENABLED else ""
+
+# ---------------------------------------------------------------------------
 # Lazy import of projection module (WS4 shrinkage)
 # ---------------------------------------------------------------------------
 # Import at module level so syntax errors surface immediately; but we guard
@@ -596,11 +632,14 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "
                 else:
                     pred_glyph = "✓ on track"
 
+                pred_col = _colour_for_pct(upper_pct)
+                rst = _reset()
+
                 print(
-                    f"  predicted: {floor_pct:.1f}% → {upper_pct:.1f}% by reset"
+                    f"  predicted: {pred_col}{floor_pct:.1f}% → {upper_pct:.1f}% by reset"
                     f"   (optimistic: active={act_frac_pct:.0f}% of elapsed, K=1h;"
                     f" if you sustain 24/7)"
-                    f"   {pred_glyph}"
+                    f"   {pred_glyph}{rst}"
                 )
 
                 # target: even-pace rate vs current rate
@@ -613,15 +652,19 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "
                         if ratio == ratio:
                             if ratio >= 1.05:
                                 pace_verdict = f"→  {ratio:.1f}× over"
+                                target_col = _colour_for_pct(upper_pct)
                             elif ratio <= 0.95:
                                 pace_verdict = f"→  {ratio:.1f}× under"
+                                target_col = _colour_for_pct(0)
                             else:
                                 pace_verdict = "→  on pace"
+                                target_col = _colour_for_pct(0)
                         else:
                             pace_verdict = ""
+                            target_col = ""
                         print(
-                            f"  target:    ≤{even_pace:.2f} pp/hr from here to land at 100%"
-                            f"  ·  you're at {sofar_pp_h:.2f}  {pace_verdict}"
+                            f"  target:    {target_col}≤{even_pace:.2f} pp/hr from here to land at 100%"
+                            f"  ·  you're at {sofar_pp_h:.2f}  {pace_verdict}{rst}"
                         )
                     else:
                         print(f"  target:    n/a (already at ceiling)")
@@ -881,13 +924,17 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
                     else:
                         pred_glyph = "✓ on track"
 
+                    # Colour fires off the upper (rtc) end — mirrors render-rates.py
+                    pred_col = _colour_for_pct(sproj_rtc)
+                    rst = _reset()
+
                     # Parenthetical: eff_rate, prior, K, windows
                     print(
-                        f"  predicted: {sproj_duty:.1f}% → {sproj_rtc:.1f}% by reset"
+                        f"  predicted: {pred_col}{sproj_duty:.1f}% → {sproj_rtc:.1f}% by reset"
                         f"   (optimistic: duty-weighted; if you sustain 24/7)"
                         f"   (eff {eff_rate:.2f} pp/hr, prior={prior_s},"
                         f" K={sr.k_used:.0f}h, wins={sr.prior_window_count})"
-                        f"   {pred_glyph}"
+                        f"   {pred_glyph}{rst}"
                     )
 
                     # ── target line: pace/headroom (rate, not level) ──
@@ -900,15 +947,19 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
                             ratio = eff_rate / even_pace
                             if ratio >= 1.05:
                                 pace_verdict = f"→  {ratio:.1f}× over"
+                                target_col = _colour_for_pct(sproj_rtc)  # same urgency as predicted
                             elif ratio <= 0.95:
                                 pace_verdict = f"→  {ratio:.1f}× under"
+                                target_col = _colour_for_pct(0)  # green: under-pacing
                             else:
                                 pace_verdict = "→  on pace"
+                                target_col = _colour_for_pct(0)  # green: on pace
                         else:
                             pace_verdict = ""
+                            target_col = ""
                         print(
-                            f"  target:    ≤{even_pace:.2f} pp/hr from here to land at 100%"
-                            f"  ·  you're at {eff_rate:.2f}  {pace_verdict}"
+                            f"  target:    {target_col}≤{even_pace:.2f} pp/hr from here to land at 100%"
+                            f"  ·  you're at {eff_rate:.2f}  {pace_verdict}{rst}"
                         )
                     else:
                         print(f"  target:    n/a (no reset timestamp)")
@@ -1301,6 +1352,16 @@ Examples:
     )
 
     ap.add_argument(
+        "--color", default="auto", choices=["auto", "always", "never"],
+        help=(
+            "ANSI colour in the human report.  "
+            "auto (default) = colour only when stdout is a tty; "
+            "always = always emit ANSI (use this under watch); "
+            "never = no colour.  Has no effect on --json or --autonomous-status."
+        ),
+    )
+
+    ap.add_argument(
         "--test-5h-stability", action="store_true",
         help=(
             "WS16: Run the 5h projection stability demo — simulates 3 early-window "
@@ -1324,6 +1385,18 @@ Examples:
     )
 
     args = ap.parse_args()
+
+    # Wire colour flag: never enable for --json or --autonomous-status (machine outputs)
+    global _COLOUR_ENABLED
+    if not getattr(args, "json", False) and not getattr(args, "autonomous_status", False):
+        if args.color == "always":
+            _COLOUR_ENABLED = True
+        elif args.color == "auto":
+            _COLOUR_ENABLED = sys.stdout.isatty()
+        else:
+            _COLOUR_ENABLED = False
+    else:
+        _COLOUR_ENABLED = False
 
     if args.test_5h_stability:
         _run_5h_stability_demo()
