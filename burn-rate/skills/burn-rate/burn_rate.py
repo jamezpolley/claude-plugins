@@ -77,15 +77,16 @@ from zoneinfo import ZoneInfo
 # Controlled by the --color flag; never leaks into --json or --autonomous-status.
 # ---------------------------------------------------------------------------
 
-# Same 256-colour ramp as render-rates.py / statusline-command.sh rate_colour()
+# Basic 16-colour SGR ramp — watch -c strips 256-colour (38;5;N) but renders
+# basic SGR (3x/9x).  render-rates.py keeps its 256-colour gradient (real tty).
 _COLOUR_RAMP = [
-    (100, "\x1b[38;5;196m"),  # bright red  ≥100
-    (90,  "\x1b[38;5;160m"),  # red         ≥90
-    (80,  "\x1b[38;5;202m"),  # orange-red  ≥80
-    (70,  "\x1b[38;5;214m"),  # amber       ≥70
-    (55,  "\x1b[38;5;75m"),   # blue        ≥55
-    (40,  "\x1b[38;5;117m"),  # light blue  ≥40
-    (0,   "\x1b[38;5;151m"),  # pale green  comfortable
+    (100, "\x1b[91m"),   # bright red    ≥100
+    (90,  "\x1b[31m"),   # red           ≥90
+    (80,  "\x1b[31m"),   # red           ≥80
+    (70,  "\x1b[93m"),   # bright yellow ≥70
+    (55,  "\x1b[33m"),   # yellow        ≥55
+    (40,  "\x1b[92m"),   # bright green  ≥40
+    (0,   "\x1b[32m"),   # green         comfortable
 ]
 _RESET = "\x1b[0m"
 
@@ -603,7 +604,7 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "
     if h_to_reset == h_to_reset and h_to_reset > 0:
         headroom = 100.0 - pct
         rem_pp_h = headroom / h_to_reset
-        verdict = "⚠ over budget — slow down" if sofar_pp_h > rem_pp_h else "✓ within budget"
+        verdict = "⚠ over budget" if sofar_pp_h > rem_pp_h else "✓ on budget"
         print(f"  remaining: {rem_pp_h:.2f} pp/hr   ·  {headroom:.0f}% over {fmt_h(h_to_reset)}   [{verdict}]")
 
     tr = fmt_trend(trend_series(cur, FIVE_HOUR_BUCKET, resets, elapsed_h=elapsed_h,
@@ -881,11 +882,11 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
                 over_24h = primary_pp_h > rem_24h
                 over_duty = (sofar_duty == sofar_duty) and (rem_duty == rem_duty) and (sofar_duty > rem_duty)
                 if over_duty:
-                    verdict = "⚠ over even on 💼 — slow down"
+                    verdict = "⚠ over budget"
                 elif over_24h:
-                    verdict = "⚠ over on 🕛, ok on 💼"
+                    verdict = "⚠ over budget"
                 else:
-                    verdict = "✓ within budget"
+                    verdict = "✓ on budget"
 
                 rem_duty_str = f"{rem_duty:.2f}" if rem_duty == rem_duty else "—"
                 print(f"  remaining: 🕛 {rem_24h:.2f}   💼 {rem_duty_str}   pp/hr"
