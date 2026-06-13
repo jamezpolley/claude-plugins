@@ -123,6 +123,35 @@ RATIONING_PCT_THRESHOLD = 80.0
 # midpoint.  Tune as more weeks accrue.
 IDLE_FLOOR_PP_H = 0.4
 
+# WS7: Per-cell duty-surface shrinkage toward the all-models prior.
+#
+# Problem: a thin bucket (e.g. sonnet_weekly) only populates a handful of the
+# 168 weekday×hour cells.  Empty cells are treated as weight 0 (idle), which
+# collapses "active capacity to reset" far below the true value.  Result: the
+# Sonnet duty-projection reads ~10.8% where ~45% is correct.
+#
+# Fix: the all-models (seven_day) surface is the PRIOR for every other bucket's
+# duty surface.  Blend per-cell, weighted by that cell's own sample count:
+#
+#   blended_cell = (n_samples · bucket_cell + M · allmodels_cell)
+#                  / (n_samples + M)
+#
+# where:
+#   n_samples  = number of qualifying active intervals in this bucket's cell
+#   bucket_cell = normalised weight from the bucket's own histogram
+#   allmodels_cell = normalised weight from the all-models (seven_day) histogram
+#   M          = pseudo-count of prior weight (duty-surface analogue of rate K)
+#
+# When n_samples == 0 (empty cell): blend = allmodels_cell → no collapse.
+# When n_samples >> M (well-sampled cell): blend → bucket_cell.
+# seven_day itself uses its own surface as prior → the blend is a self-blend
+# (prior == self) and the formula simplifies to bucket_cell → exact no-op.
+#
+# M = 4 (active samples) is the starting point — "four representative
+# burns establish a cell".  Tune down toward 1-2 when Sonnet data is denser,
+# up toward 8-10 if the all-models prior is very noisy.
+DUTY_PRIOR_M = 4
+
 # Histogram hygiene: exclude reset / account-switch jumps — a positive delta
 # greater than this many pp in under JUMP_MAX_GAP_H hours is not continuous
 # burn (it's a reset artefact or account switch).
@@ -791,7 +820,7 @@ def _build_burn_histogram(
     bucket: str,
     windows: list[QuotaWindow],
     de_ration: bool,
-) -> dict[int, float]:
+) -> tuple[dict[int, float], dict[int, int]]:
     """Build a per-hour-of-week burn histogram (pp accumulated per cell).
 
     Activity signal = per-hour pp/hr, NOT snapshot coverage (idle-but-open
@@ -814,8 +843,13 @@ def _build_burn_histogram(
         their day-of-week-symmetric counterpart (Fri-night ≈ Mon-night) — see
         _impute_natural_cells().
 
-    Returns {hour_of_week (0..167): total_active_pp}. Cells with no qualifying
-    burn are absent (treated as 0 by the caller).
+    Returns:
+      (hist, sample_counts) where:
+        hist         = {hour_of_week (0..167): total_active_pp}
+        sample_counts = {hour_of_week (0..167): n_qualifying_intervals}
+
+    Cells with no qualifying burn are absent from both dicts (treated as 0 by
+    the caller).  sample_counts is used by the WS7 per-cell prior blend.
     """
     # Restrict to work-account windows for the duty profile (personal account
     # is a different quota scale and rhythm).
@@ -833,6 +867,7 @@ def _build_burn_histogram(
     parsed = [(_to_utc(_parse_iso(ts)), pct, ra) for ts, pct, ra in all_snaps]
 
     hist: dict[int, float] = {}
+    sample_counts: dict[int, int] = {}
 
     for win_start, win_end, win_censored in span_index:
         # Snapshots strictly within this window, sorted
@@ -873,8 +908,9 @@ def _build_burn_histogram(
             mid = t_prev + (t_curr - t_prev) / 2
             how = _hour_of_week(mid)
             hist[how] = hist.get(how, 0.0) + delta
+            sample_counts[how] = sample_counts.get(how, 0) + 1
 
-    return hist
+    return hist, sample_counts
 
 
 def _impute_natural_cells(hist: dict[int, float]) -> dict[int, float]:
@@ -983,12 +1019,55 @@ def _active_capacity_remaining_2d(
     return total
 
 
+def _blend_duty_weights(
+    bucket_weights: dict[int, float],
+    bucket_counts: dict[int, int],
+    prior_weights: dict[int, float],
+    M: float = DUTY_PRIOR_M,
+) -> dict[int, float]:
+    """WS7: Blend bucket's duty weights toward the all-models prior per-cell.
+
+    Formula (see DUTY_PRIOR_M docstring above):
+        blended[cell] = (n · w_bucket + M · w_prior) / (n + M)
+
+    where n = bucket's sample count for this cell.
+
+    Scaling note: both bucket_weights and prior_weights are already
+    mean-normalised to ~1.0 by _histogram_to_weights(), so they share the
+    same scale.  The blend is a weighted-average on that shared scale, keeping
+    the output on the same ~1.0 mean scale.  This preserves the invariant that
+    _active_capacity_remaining_2d() returns a count comparable to the
+    flat-window count (≈ active hours, just weighted).
+
+    Empty bucket cells (n=0) fall back entirely to the prior (no collapse).
+    Well-sampled cells (n >> M) graduate toward their own observed shape.
+
+    When prior_weights is the bucket's own weights (seven_day is its own prior),
+    this is a self-blend: (n · w + M · w) / (n + M) = w — exact no-op.
+    """
+    if not prior_weights:
+        # No prior available — return bucket weights unchanged (safe fallback).
+        return bucket_weights
+
+    all_cells = set(bucket_weights.keys()) | set(prior_weights.keys())
+    blended: dict[int, float] = {}
+    for cell in all_cells:
+        n = bucket_counts.get(cell, 0)
+        w_bucket = bucket_weights.get(cell, 0.0)
+        w_prior = prior_weights.get(cell, 0.0)
+        blended[cell] = (n * w_bucket + M * w_prior) / (n + M)
+
+    # Drop zero-weight cells (cells where both bucket and prior had 0 weight).
+    return {c: v for c, v in blended.items() if v > 0.0}
+
+
 def duty_surface(
     conn: sqlite3.Connection,
     bucket: str,
     now: Optional[datetime] = None,
     reset_dt: Optional[datetime] = None,
     surface_kind: str = 'actual',
+    prior_bucket: Optional[str] = None,
 ) -> DutySurface:
     """Return the empirical 2D weekday×hour duty surface (UTC, week from Sat 00:00).
 
@@ -999,8 +1078,20 @@ def duty_surface(
                   unconstrained mirror (Fri-night ≈ Mon-night). Prevents the
                   rationing feedback loop the Objective warns about.
 
+    prior_bucket (WS7):
+      When set to a different bucket name (typically 'seven_day'), the prior
+      bucket's normalised duty weights are used as a Bayesian prior for each
+      cell, blended in by sample count (see _blend_duty_weights and DUTY_PRIOR_M).
+      This prevents empty (unsampled) cells from collapsing to 0, which caused
+      the Sonnet duty projection to read ~10.8% when ~45% was correct.
+
+      When prior_bucket == bucket (or None), the blend is a no-op (self-prior).
+      project() passes prior_bucket='seven_day' for all non-seven_day buckets.
+
     Falls back to the flat 07-24 UTC window when there is not enough histogram
-    data to build a surface (e.g. a brand-new bucket).
+    data to build a surface (e.g. a brand-new bucket), but only AFTER the
+    prior-blend is applied — the blend typically rescues thin buckets from this
+    fallback by filling empty cells with the all-models prior shape.
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -1017,17 +1108,39 @@ def duty_surface(
 
     windows = _extract_windows(conn, bucket, now)
     de_ration = (surface_kind == 'natural')
-    hist = _build_burn_histogram(conn, bucket, windows, de_ration=de_ration)
+    hist, sample_counts = _build_burn_histogram(conn, bucket, windows, de_ration=de_ration)
     if de_ration:
         hist = _impute_natural_cells(hist)
 
     weights = _histogram_to_weights(hist)
     active_per_day = ACTIVE_END_HOUR_UTC - ACTIVE_START_HOUR_UTC  # 17 (informational)
 
+    # WS7: Per-cell prior blend.
+    # Build the prior weights from prior_bucket if it differs from this bucket.
+    # seven_day is self-prior → blend is a mathematical no-op (see docstring).
+    # NOTE: we blend BEFORE the MIN_CELLS_FOR_2D check so the filled-in prior
+    # cells count toward that threshold and spare thin buckets from falling back
+    # to the flat window.
+    effective_prior_bucket = prior_bucket if prior_bucket else bucket
+    if effective_prior_bucket != bucket:
+        # Fetch and normalise the prior bucket's histogram.
+        prior_windows = _extract_windows(conn, effective_prior_bucket, now)
+        prior_hist, _prior_counts = _build_burn_histogram(
+            conn, effective_prior_bucket, prior_windows, de_ration=de_ration
+        )
+        if de_ration:
+            prior_hist = _impute_natural_cells(prior_hist)
+        prior_weights = _histogram_to_weights(prior_hist)
+        # Blend: cells missing from bucket fall back to the prior's shape.
+        weights = _blend_duty_weights(weights, sample_counts, prior_weights)
+
     # NOTE: require a minimum number of populated cells before trusting the 2D
     # surface. With ~3-5 weeks the per-cell magnitudes are noisy; below this
     # floor we fall back to the flat window (more honest than a sparse surface).
     # Raise this floor as more weeks accrue (the surface gets denser).
+    # With WS7 prior-blend, thin buckets will typically clear this threshold
+    # (prior fills empty cells); the fallback is still a last resort for
+    # completely data-free buckets (e.g. a brand-new install).
     MIN_CELLS_FOR_2D = 12
     if len([v for v in weights.values() if v > 0]) < MIN_CELLS_FOR_2D:
         active_remaining = _active_hours_remaining_empirical(now, reset_dt)
@@ -1259,9 +1372,12 @@ def project(
         # Duty surface: PREDICTIVE uses the ACTUAL demand surface (incl.
         # rationing); TARGET uses the DE-RATIONED natural surface so the
         # even-pace line breathes on natural, not suppressed, demand.
+        # WS7: pass prior_bucket='seven_day' for all non-seven_day buckets so
+        # empty cells fall back to the all-models shape (no collapse to idle).
         surface_kind = 'natural' if mode == 'target' else 'actual'
+        ws7_prior = 'seven_day' if bucket != 'seven_day' else None
         ds = duty_surface(conn, bucket, now=now, reset_dt=reset_dt,
-                          surface_kind=surface_kind)
+                          surface_kind=surface_kind, prior_bucket=ws7_prior)
         projected_duty = current_pct + eff_rate * ds.active_hours_remaining
         notes.append(
             f"Duty surface [{ds.method}]: {ds.active_hours_remaining:.1f} "
