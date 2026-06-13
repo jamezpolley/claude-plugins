@@ -522,7 +522,7 @@ def fmt_duty_line(
 # Rolling 5-hour bucket
 # ---------------------------------------------------------------------------
 
-def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor) -> None:
+def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor, mode: str = "predictive") -> None:
     """Print the rolling 5-hour All-Models bucket stanza.
 
     Unlike the weekly buckets, the cycle is 5h: the window START is
@@ -574,36 +574,79 @@ def report_five_hour(con: sqlite3.Connection, cur: sqlite3.Cursor) -> None:
     if tr is not None:
         print(f"  trend:     {tr}")
 
-    if sofar_pp_h <= 0:
-        print("  ETA:       not increasing — no exhaustion projected")
-    else:
-        pp_remaining = 100.0 - pct
-        hrs_to_100 = pp_remaining / sofar_pp_h
-        exhaust_at = now + timedelta(hours=hrs_to_100)
-        if exhaust_at < reset_dt:
-            margin_h = (reset_dt - exhaust_at).total_seconds() / 3600.0
-            print(f"  ETA:       100% in {fmt_h(hrs_to_100)} "
-                  f"(at {exhaust_at.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
-                  f"⚠ BEFORE reset by {fmt_h(margin_h)}")
-        else:
-            pct_at_reset = pct + sofar_pp_h * h_to_reset
-            print(f"  ETA:       {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
-
-    # WS16: activity-weighted shrinkage projection for 5h bucket
-    if _PROJECTION_AVAILABLE and _project_five_hour_fn is not None:
+    # ── Phase F: predicted range + target (replaces bare ETA line) ──────────
+    # Default (predictive/target) mode: show predicted range floor→rtc + target.
+    # Naive mode: keep the legacy ETA line verbatim (--mode naive is the control).
+    _fhr_done = False
+    if mode != "naive" and _PROJECTION_AVAILABLE and _project_five_hour_fn is not None:
         try:
             fhr = _project_five_hour_fn(con, now=now)
-            if fhr is not None:
-                if fhr.path == 'activity_weighted':
-                    act_frac_pct = fhr.active_fraction * 100
-                    print(
-                        f"  predicted: {fhr.projected_pct_at_reset:.1f}% by reset"
-                        f"   (activity-weighted shrinkage; active={act_frac_pct:.0f}%"
-                        f" of elapsed, K=1h)   [WS16]"
-                    )
-                # naive_fallback: don't double-print — ETA above already shows it
-        except Exception as _fhr_err:
-            pass  # non-fatal — ETA line still shown above
+            if fhr is not None and fhr.path == 'activity_weighted':
+                # floor = activity-weighted shrinkage (optimistic: excludes idle time)
+                # upper = naive wall-clock (if you sustain this 24/7 — burns 100% of time)
+                floor_pct = fhr.projected_pct_at_reset
+                upper_pct = fhr.naive_projected_pct
+                act_frac_pct = fhr.active_fraction * 100
+
+                # Glyph/colour fires off the upper (rtc) end
+                if upper_pct >= 100.0:
+                    pred_glyph = "⚠ over ceiling"
+                elif upper_pct >= 80.0:
+                    pred_glyph = "⚠ caution"
+                else:
+                    pred_glyph = "✓ on track"
+
+                print(
+                    f"  predicted: {floor_pct:.1f}% → {upper_pct:.1f}% by reset"
+                    f"   (optimistic: active={act_frac_pct:.0f}% of elapsed, K=1h;"
+                    f" if you sustain 24/7)"
+                    f"   {pred_glyph}"
+                )
+
+                # target: even-pace rate vs current rate
+                if h_to_reset == h_to_reset and h_to_reset > 0 and sofar_pp_h > 0:
+                    pp_remaining = 100.0 - pct
+                    even_pace = pp_remaining / h_to_reset
+                    if even_pace > 0:
+                        blended_pp_h = fhr.blended_rate_pp_s * 3600 * fhr.active_fraction
+                        ratio = blended_pp_h / even_pace if even_pace > 0 else float("nan")
+                        if ratio == ratio:
+                            if ratio >= 1.05:
+                                pace_verdict = f"→  {ratio:.1f}× over"
+                            elif ratio <= 0.95:
+                                pace_verdict = f"→  {ratio:.1f}× under"
+                            else:
+                                pace_verdict = "→  on pace"
+                        else:
+                            pace_verdict = ""
+                        print(
+                            f"  target:    ≤{even_pace:.2f} pp/hr from here to land at 100%"
+                            f"  ·  you're at {sofar_pp_h:.2f}  {pace_verdict}"
+                        )
+                    else:
+                        print(f"  target:    n/a (already at ceiling)")
+                elif sofar_pp_h <= 0:
+                    print(f"  predicted: not increasing — no exhaustion projected")
+                _fhr_done = True
+        except Exception:
+            pass  # non-fatal — fall through to legacy ETA
+
+    if not _fhr_done:
+        # Legacy ETA (naive mode or projection unavailable)
+        if sofar_pp_h <= 0:
+            print("  ETA:       not increasing — no exhaustion projected")
+        else:
+            pp_remaining = 100.0 - pct
+            hrs_to_100 = pp_remaining / sofar_pp_h
+            exhaust_at = now + timedelta(hours=hrs_to_100)
+            if exhaust_at < reset_dt:
+                margin_h = (reset_dt - exhaust_at).total_seconds() / 3600.0
+                print(f"  ETA:       100% in {fmt_h(hrs_to_100)} "
+                      f"(at {exhaust_at.astimezone(_LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')})  "
+                      f"⚠ BEFORE reset by {fmt_h(margin_h)}")
+            else:
+                pct_at_reset = pct + sofar_pp_h * h_to_reset
+                print(f"  ETA:       {pct_at_reset:.1f}% by reset  (no exhaustion at this rate)")
     print()
 
 
@@ -709,7 +752,7 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
     print()
 
     # Rolling 5-hour bucket first — shortest fuse, most urgent.
-    report_five_hour(con, cur)
+    report_five_hour(con, cur, mode=mode)
 
     # Collapse seven_day + all_models_weekly into one logical bucket;
     # pick the bucket with the newest snapshot per label.
@@ -825,24 +868,25 @@ def report(window: timedelta, con: sqlite3.Connection, cur: sqlite3.Cursor,
                 else:
                     pp_remaining = 100.0 - pct
 
-                    # ── predicted line: duty-adjusted level + glyph escalation ──
-                    # Glyph mirrors the bucket value's escalation rule:
-                    #   ≥100%          → ⚠ over ceiling
-                    #   ≥80%  (<100%)  → ⚠ caution
-                    #   else           → ✓ on track
-                    if sproj_duty >= 100.0:
+                    # ── Phase F: predicted range (duty floor → rtc upper) ────
+                    # duty = optimistic lower bound (only counts active/duty hours)
+                    # rtc  = upper bound (if you sustain this rate 24/7 to reset)
+                    # Glyph/colour fires off the upper (rtc) end so real risk grabs
+                    # attention — not off the optimistic floor.
+                    sproj_rtc = sr.projected_pct_at_reset  # upper bound (round-the-clock)
+                    if sproj_rtc >= 100.0:
                         pred_glyph = "⚠ over ceiling"
-                    elif sproj_duty >= 80.0:
+                    elif sproj_rtc >= 80.0:
                         pred_glyph = "⚠ caution"
                     else:
                         pred_glyph = "✓ on track"
 
-                    # Parenthetical folds in what the old `projection [mode]:` line had:
-                    # eff_rate, prior, K, windows — rtc demoted to debug (not shown).
+                    # Parenthetical: eff_rate, prior, K, windows
                     print(
-                        f"  predicted: {sproj_duty:.1f}% by reset"
-                        f"   (eff {eff_rate:.2f} pp/hr, duty-weighted,"
-                        f" prior={prior_s}, K={sr.k_used:.0f}h, wins={sr.prior_window_count})"
+                        f"  predicted: {sproj_duty:.1f}% → {sproj_rtc:.1f}% by reset"
+                        f"   (optimistic: duty-weighted; if you sustain 24/7)"
+                        f"   (eff {eff_rate:.2f} pp/hr, prior={prior_s},"
+                        f" K={sr.k_used:.0f}h, wins={sr.prior_window_count})"
                         f"   {pred_glyph}"
                     )
 

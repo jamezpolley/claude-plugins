@@ -1663,7 +1663,12 @@ class FiveHourProjectionResult:
     """Result of project_five_hour().
 
     All time values are in seconds.  The headline field is
-    `projected_pct_at_reset` — the activity-weighted shrinkage estimate.
+    `projected_pct_at_reset` — the activity-weighted shrinkage estimate
+    (optimistic floor: accounts for idle time, shrunk toward prior).
+
+    `naive_projected_pct` is the raw wall-clock upper bound (pct/elapsed × full
+    window), useful as the upper end of the predicted range displayed in the
+    report.  For Phase F: predicted: <floor>% → <rtc>% by reset.
     """
     current_pct: float
     elapsed_wall_s: float          # wall seconds since window start
@@ -1673,7 +1678,8 @@ class FiveHourProjectionResult:
     obs_active_rate_pp_s: float    # observed pp per active second
     prior_rate_pp_s: float         # trailing ~5h activity rate (prior)
     blended_rate_pp_s: float       # shrinkage-blended per-active-second rate
-    projected_pct_at_reset: float  # headline: blended_rate × expected_active_remaining
+    projected_pct_at_reset: float  # floor/optimistic: blended_rate × expected_active_remaining
+    naive_projected_pct: float     # upper bound: naive wall-clock (pct/elapsed × full window)
     path: str                      # 'activity_weighted' | 'naive_fallback'
     notes: list[str]
 
@@ -1885,6 +1891,7 @@ def project_five_hour(
             prior_rate_pp_s=0.0,
             blended_rate_pp_s=naive_rate_pp_s,
             projected_pct_at_reset=naive_proj,
+            naive_projected_pct=naive_proj,
             path='naive_fallback',
             notes=notes,
         )
@@ -1950,6 +1957,7 @@ def project_five_hour(
         prior_rate_pp_s=prior_rate_pp_s,
         blended_rate_pp_s=blended_rate_pp_s,
         projected_pct_at_reset=projected_pct,
+        naive_projected_pct=naive_proj,
         path='activity_weighted',
         notes=notes,
     )
