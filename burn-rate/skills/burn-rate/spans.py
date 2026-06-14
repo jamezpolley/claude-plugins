@@ -234,6 +234,43 @@ def _running_max_readings(
 # Main span extraction
 # ---------------------------------------------------------------------------
 
+def _fetch_7d_stamp_for_row(conn: sqlite3.Connection, bucket: str) -> dict:
+    """WS17: Return {snapshot_ts -> canonical seven_day_resets_at datetime or None}
+    for all rows in `bucket` that have a non-NULL seven_day_resets_at stamp.
+
+    Used only for non-seven_day buckets (five_hour, sonnet_weekly) where the
+    bucket's own resets_at is not a Saturday anchor.  The stamp is the co-captured
+    seven_day resets_at from the same /usage call, which IS the account anchor.
+
+    Returns an empty dict if the column doesn't exist (pre-WS17 schema) or if
+    the bucket is seven_day itself (not needed — seven_day uses its own resets_at).
+    """
+    if bucket == "seven_day":
+        return {}
+    try:
+        col_names = {row[1] for row in conn.execute("PRAGMA table_info(quota_snapshots)")}
+        if "seven_day_resets_at" not in col_names:
+            return {}
+        rows = conn.execute(
+            "SELECT snapshot_ts, seven_day_resets_at "
+            "FROM quota_snapshots "
+            "WHERE bucket=? AND seven_day_resets_at IS NOT NULL",
+            (bucket,),
+        ).fetchall()
+        result = {}
+        for ts_s, stamp_s in rows:
+            if stamp_s is None:
+                continue
+            try:
+                stamp_dt = _parse(stamp_s)
+            except (ValueError, OverflowError):
+                continue
+            result[ts_s] = stamp_dt
+        return result
+    except sqlite3.OperationalError:
+        return {}
+
+
 def extract_spans(
     conn: sqlite3.Connection,
     bucket: str,
@@ -247,6 +284,11 @@ def extract_spans(
     Steps:
     1. Fetch all non-garbage readings, group by (canonical resets_at).
     2. Discard personal-account generations (Wrinkle 1).
+       - For seven_day: classify via the row's own resets_at (Sat 00:00 UTC = work).
+       - For five_hour/sonnet_weekly (WS17): classify via the stamped
+         seven_day_resets_at column (same account signal, co-captured at write time).
+         Rows with NULL stamp (pre-WS17) are treated as unclassifiable and excluded;
+         this is acceptable because the WS16 5h prior is recent-anchored.
     3. For each work generation, split at any reset_history boundary that falls
        inside the generation's week (Wrinkle 2).
     4. For each sub-span, apply running-max to its readings (data hygiene).
@@ -271,12 +313,21 @@ def extract_spans(
     if not rows:
         return []
 
+    # WS17: for non-seven_day buckets, load the account stamp map
+    # {snapshot_ts_str -> canonical seven_day_resets_at datetime}.
+    # For seven_day itself this returns {} — not needed.
+    stamp_map = _fetch_7d_stamp_for_row(conn, bucket)
+
     # Wrinkle 0: canonicalise all resets_at labels
     raw_labels = list({ra for _, _, ra in rows})
     canon_map = _canonicalise_resets_at(raw_labels)  # raw -> canonical datetime
 
-    # Group readings by canonical reset label
+    # Group readings by canonical reset label.
+    # For non-seven_day buckets: also track the set of seven_day_resets_at stamps
+    # seen in each generation (for Wrinkle 1 account classification).
     gen_readings: dict[datetime, list[tuple[datetime, float]]] = {}
+    # gen_stamps[canon_dt] = set of canonical stamp datetimes seen (WS17, non-7d only)
+    gen_stamps: dict[datetime, set[datetime]] = {}
     for ts_s, pct, ra_s in rows:
         try:
             ts = _parse(ts_s)
@@ -286,6 +337,11 @@ def extract_spans(
         if canon_dt is None:
             continue
         gen_readings.setdefault(canon_dt, []).append((ts, pct))
+        # WS17: collect stamps for this generation
+        if stamp_map:
+            stamp_dt = stamp_map.get(ts_s)
+            if stamp_dt is not None:
+                gen_stamps.setdefault(canon_dt, set()).add(stamp_dt)
 
     # Sort readings within each generation by ts
     for canon_dt in gen_readings:
@@ -298,16 +354,47 @@ def extract_spans(
 
     for resets_at_dt, raw_readings in sorted(gen_readings.items()):
         # --- Wrinkle 1: personal account? ---
-        is_work = _is_saturday_midnight_utc(resets_at_dt)
+        if bucket == "seven_day":
+            # Seven-day bucket: the row's own resets_at IS the account anchor.
+            is_work = _is_saturday_midnight_utc(resets_at_dt)
+        else:
+            # WS17 — five_hour / sonnet_weekly:
+            # Use the stamped seven_day_resets_at values collected for this generation.
+            # A generation is work iff at least one stamp classifies as Sat 00:00 UTC.
+            # Rows with no stamp (NULL) are pre-WS17 historical rows: treat as
+            # unclassifiable (exclude from prior). Dropping them is acceptable —
+            # the WS16 5h prior is recent-anchored and the NULL rows are older.
+            stamps = gen_stamps.get(resets_at_dt)
+            if not stamps:
+                # No stamp at all: pre-WS17 historical generation — skip entirely
+                # (not personal, not work — just unclassifiable old data).
+                continue
+            # Apply Wrinkle 0 canonicalisation to stamps before checking Sat-midnight
+            raw_stamp_labels = [s.strftime("%Y-%m-%dT%H:%M:%SZ") for s in stamps]
+            stamp_canon_map = _canonicalise_resets_at(raw_stamp_labels)
+            canon_stamp_dts = set(stamp_canon_map.values())
+            is_work = any(_is_saturday_midnight_utc(s) for s in canon_stamp_dts)
+
         if not is_work:
-            # Emit a rejected personal-account span for completeness
+            # Emit a rejected personal-account span for completeness.
+            # For the seven_day bucket the span boundaries are week-aligned.
+            # For non-seven_day buckets, the bucket's own resets_at is not a 7d
+            # anchor so we fall back to reading extent for the span boundaries.
             pcts = [p for _, p in raw_readings]
+            if bucket == "seven_day":
+                span_start = resets_at_dt - timedelta(days=7)
+                span_end = resets_at_dt
+                span_h = 168.0
+            else:
+                span_start = raw_readings[0][0] if raw_readings else resets_at_dt - timedelta(hours=5)
+                span_end = raw_readings[-1][0] if raw_readings else resets_at_dt
+                span_h = (span_end - span_start).total_seconds() / 3600.0
             spans.append(Span(
                 resets_at=resets_at_dt,
-                start_ts=resets_at_dt - timedelta(days=7),
-                end_ts=resets_at_dt,
+                start_ts=span_start,
+                end_ts=span_end,
                 delta_pp=max(pcts) if pcts else 0.0,
-                span_h=168.0,
+                span_h=max(span_h, 0.0),
                 rate_pp_h=0.0,
                 first_reading_ts=raw_readings[0][0] if raw_readings else None,
                 first_reading_pct=raw_readings[0][1] if raw_readings else None,
@@ -316,7 +403,16 @@ def extract_spans(
             ))
             continue
 
-        # Work generation: week boundaries
+        # Work generation: week (or window) boundaries.
+        # For all buckets: use resets_at as the end boundary and resets_at - 7d
+        # as the start boundary. For the seven_day bucket this is the exact 7-day
+        # window. For five_hour/sonnet_weekly the resets_at is a shorter-cycle
+        # reset anchor; the 7d lookback overstates the window, but in practice
+        # the actual reading density (not the declared boundary) drives the rate
+        # calculation — the sub-span loop collects only readings within the window,
+        # so an oversized declared window just produces an in-progress span that
+        # spans a lot of empty time. This is pre-existing behaviour; WS17 only
+        # adds the account-classification filter, not a geometry change.
         week_start = resets_at_dt - timedelta(days=7)
         week_end = resets_at_dt
 

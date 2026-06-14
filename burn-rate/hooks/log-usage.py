@@ -247,6 +247,18 @@ def ensure_schema(conn):
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_quota_bucket_ts ON quota_snapshots(bucket, snapshot_ts)")
 
+    # WS17: account-separation stamp. Add seven_day_resets_at column idempotently.
+    # five_hour and sonnet_weekly rows carry this so the 5h projection can
+    # distinguish work vs personal account at read time (Sat 00:00 UTC = work).
+    # seven_day rows already carry their own resets_at; stamping them is redundant.
+    # Historical rows stay NULL — they pre-date this column.
+    existing_quota_cols = {row[1] for row in conn.execute("PRAGMA table_info(quota_snapshots)")}
+    if "seven_day_resets_at" not in existing_quota_cols:
+        try:
+            conn.execute("ALTER TABLE quota_snapshots ADD COLUMN seven_day_resets_at TEXT")
+        except Exception:
+            pass  # race: another writer added it first; swallow "duplicate column"
+
     # State table for delta tracking: stores last-seen cumulative per (session_id, model).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS usage_state (
@@ -408,6 +420,22 @@ def write_snapshot(session_id, cwd, transcript_path, totals, drained_lines):
                 # quota_snapshots: global — dedupe to latest statusline across ALL sessions per bucket.
                 if statusline_lines:
                     latest_global = max(statusline_lines, key=lambda l: l.get("ts", ""))
+
+                    # WS17: extract the seven_day resets_at from this same payload so
+                    # five_hour/sonnet rows can be stamped with it.  The stamp enables
+                    # work-vs-personal classification at read time (Sat 00:00 UTC = work).
+                    # All three buckets are captured in one moment from one account, so
+                    # the seven_day resets_at is authoritative for the co-captured rows.
+                    _7d_epoch = latest_global.get("seven_day_resets_at")
+                    _7d_resets_iso = None
+                    if isinstance(_7d_epoch, (int, float)):
+                        try:
+                            _7d_resets_iso = datetime.fromtimestamp(
+                                _7d_epoch, tz=timezone.utc
+                            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        except (OSError, ValueError, OverflowError):
+                            _7d_resets_iso = None
+
                     quota_rows = []
                     for bucket, pct_key, reset_key in (
                         ("five_hour", "five_hour_pct", "five_hour_resets_at"),
@@ -423,10 +451,15 @@ def write_snapshot(session_id, cwd, transcript_path, totals, drained_lines):
                                 reset_iso = datetime.fromtimestamp(reset_epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                             except (OSError, ValueError, OverflowError):
                                 reset_iso = None
-                        quota_rows.append((now_iso, bucket, float(pct), reset_iso, "statusline"))
+                        # WS17: stamp five_hour rows with the concurrent seven_day resets_at.
+                        # seven_day rows are NOT stamped (their own resets_at is the anchor).
+                        stamp = _7d_resets_iso if bucket == "five_hour" else None
+                        quota_rows.append((now_iso, bucket, float(pct), reset_iso, "statusline", stamp))
                     if quota_rows:
                         conn.executemany(
-                            "INSERT INTO quota_snapshots (snapshot_ts, bucket, pct_used, resets_at, source) VALUES (?, ?, ?, ?, ?)",
+                            "INSERT INTO quota_snapshots "
+                            "(snapshot_ts, bucket, pct_used, resets_at, source, seven_day_resets_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
                             quota_rows,
                         )
 
@@ -751,7 +784,9 @@ def snapshot_from_usage_cli(conn, now_iso):
             "seven_day":     r"Current week \(all models\):\s*(\d+)%\s*used\s*[·•]\s*resets\s+(.+)",
             "sonnet_weekly": r"Current week \(Sonnet only\):\s*(\d+)%\s*used\s*[·•]\s*resets\s+(.+)",
         }
-        rows = []
+        # WS17: parse all buckets first so we can stamp five_hour/sonnet_weekly
+        # with the concurrent seven_day resets_at before writing rows.
+        parsed_buckets = {}
         for bucket, pat in patterns.items():
             m = re.search(pat, output)
             if not m:
@@ -761,12 +796,22 @@ def snapshot_from_usage_cli(conn, now_iso):
             except (ValueError, TypeError):
                 continue
             resets_at = _parse_reset_str(m.group(2).strip())
-            rows.append((now_iso, bucket, pct, resets_at, "usage_cli"))
+            parsed_buckets[bucket] = (pct, resets_at)
+
+        _7d_resets_iso = parsed_buckets.get("seven_day", (None, None))[1]
+
+        rows = []
+        for bucket, (pct, resets_at) in parsed_buckets.items():
+            # WS17: stamp five_hour and sonnet_weekly with the co-captured seven_day
+            # resets_at.  seven_day rows are NOT stamped (their own resets_at suffices).
+            stamp = _7d_resets_iso if bucket in ("five_hour", "sonnet_weekly") else None
+            rows.append((now_iso, bucket, pct, resets_at, "usage_cli", stamp))
 
         if rows:
             conn.executemany(
-                "INSERT INTO quota_snapshots (snapshot_ts, bucket, pct_used, resets_at, source)"
-                " VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO quota_snapshots "
+                "(snapshot_ts, bucket, pct_used, resets_at, source, seven_day_resets_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
                 rows,
             )
     except Exception:
