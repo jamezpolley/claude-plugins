@@ -66,6 +66,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+# Phase A (WS10/WS11/epoch-fix): import clean span extraction and pooled prior.
+# spans.py lives alongside this file; import lazily to avoid circular deps.
+try:
+    from spans import (
+        extract_spans as _spans_extract,
+        get_effective_epoch as _spans_get_epoch,
+        pooled_prior as _spans_pooled_prior,
+        Span as _Span,
+    )
+    _SPANS_AVAILABLE = True
+except ImportError:
+    _SPANS_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -174,6 +187,36 @@ RECENCY_THIN_MAX = 5
 RECENCY_MATURE_MIN = 8
 RECENCY_ROLLING_WEEKS = 12        # rolling window cap once mature
 RECENCY_DECAY_HALFLIFE_WEEKS = 5  # exponential-decay half-life (4-6wk range)
+
+# ---------------------------------------------------------------------------
+# WS16: 5h activity-weighted shrinkage constants
+# ---------------------------------------------------------------------------
+# K for 5h shrinkage prior: 1 hour of pseudo-evidence.  Much shorter than the
+# 24h K used for the weekly bucket — the 5h window is itself only 5 hours, so
+# a 24h K would swamp all real observations.  1h means the blend crosses into
+# observation-dominated at elapsed=1h, which is about 20% into the 5h window.
+FIVE_HOUR_K_SECONDS = 3600.0   # K = 1.0 hours in seconds
+
+# Active-fraction clamp for the 5h projection: keeps the projected remaining
+# active time from going to 0 (all-idle) or 1 (all-active) based on a very
+# short elapsed sample.
+FIVE_HOUR_ACTIVE_FRAC_MIN = 0.1
+FIVE_HOUR_ACTIVE_FRAC_MAX = 0.9
+
+# Minimum active elapsed (seconds) before using activity-weighted path;
+# below this the denominator is too small to produce a stable per-active-hour
+# rate, so we fall back to the naive wall-clock path.
+FIVE_HOUR_MIN_ACTIVE_S = 60.0
+
+# Account-separation limitation (documented): the 5h bucket has no
+# Saturday-reset anchor to distinguish work vs personal account.  All-account
+# tokens are used for the 5h projection.  This is noted here so future work
+# can add an account separator when the DB starts tagging rows by account.
+# See WS16 in Burn-Rate_Plugin_Consolidation.md.
+FIVE_HOUR_ACCOUNT_NOTE = (
+    "5h projection uses all-account tokens (no Saturday-reset anchor to "
+    "separate work vs personal quota); limitation documented in WS16."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -682,37 +725,68 @@ def compute_prior(
 ) -> tuple[float, list[QuotaWindow]]:
     """Compute the span-correct, recency-weighted historical prior for `bucket`.
 
+    Phase A (WS10/WS11): delegates to spans.py when available for the correct
+    pooled-prior calculation.  Falls back to the legacy _extract_windows path
+    when spans.py is not importable (e.g., during a transition period).
+
     Returns (prior_pp_per_hour, list_of_windows_used).
 
-    Algorithm:
-    1. Extract all real quota windows.
-    2. Filter to work-account, completed windows only.
-    3. Use each window's actual data span (not assumed 168h).
-    4. Right-censored windows (hit ~100%) contribute their observed rate as a
-       lower bound — included directly (their rate is >= true rate). Safe
-       (understates), and K damps early-week spikes regardless.
-    5. Apply the recency policy (_select_windows_by_recency): equal-weight while
-       thin, rolling-window + exponential decay once mature.
-    6. Prior = recency-weighted mean of window rates.
-
-    `now` is injectable for deterministic testing (decay is computed relative
-    to it). Defaults to wall-clock now.
+    The returned list is typed as list[QuotaWindow] for API compatibility; when
+    the spans path is used, the objects are actually spans._Span instances but
+    they expose compatible attributes (start_ts, end_ts, end_pct, rate_pp_h,
+    is_censored, is_completed).
     """
     if now is None:
         now = datetime.now(timezone.utc)
-    windows = _extract_windows(conn, bucket, now)
 
-    # Filter to: work account + completed only
+    if _SPANS_AVAILABLE:
+        # Phase A path: use canonical span extraction + WS11 pooled prior
+        spans = _spans_extract(conn, bucket, now)
+        eligible = [s for s in spans if s.prior_eligible]
+
+        if not eligible:
+            return 0.7, []
+
+        # Recency weight function (mirrors legacy recency policy).
+        # THIN (<=5 spans): equal weight; MATURE (>=8): rolling+decay.
+        # For now, delegate to the same _select_windows_by_recency logic but
+        # operating on spans.  We adapt by building QuotaWindow proxies so we
+        # can reuse the existing recency machinery without duplicating it.
+        proxy_windows = [
+            QuotaWindow(
+                bucket=bucket,
+                start_ts=s.start_ts,
+                end_ts=s.end_ts,
+                start_pct=0.0,
+                end_pct=s.delta_pp,
+                actual_span_h=s.span_h,
+                rate_pp_h=s.rate_pp_h,
+                is_work_account=True,   # eligible already filters personal
+                is_censored=s.is_censored,
+                is_completed=True,
+                source='spans_py',
+            )
+            for s in eligible
+        ]
+        weighted_pairs, _ = _select_windows_by_recency(proxy_windows, now)
+
+        # WS11: pooled prior — Σ(w·Δpp) / Σ(w·hours) NOT mean-of-rates
+        sum_w_pp = sum(wt * w.end_pct for w, wt in weighted_pairs)
+        sum_w_h = sum(wt * w.actual_span_h for w, wt in weighted_pairs)
+        prior = sum_w_pp / sum_w_h if sum_w_h > 0 else 0.7
+
+        return prior, [w for w, _ in weighted_pairs]
+
+    # Legacy fallback path (spans.py not available)
+    windows = _extract_windows(conn, bucket, now)
     work_completed = [
         w for w in windows
         if w.is_work_account and w.is_completed and w.rate_pp_h >= 0
     ]
-
     if not work_completed:
-        # No clean work windows — fall back to all completed windows (any account).
         all_completed = [w for w in windows if w.is_completed and w.rate_pp_h >= 0]
         if not all_completed:
-            return 0.7, []  # absolute fallback: conservative ~0.7 pp/hr default
+            return 0.7, []
         weighted, _ = _select_windows_by_recency(all_completed, now)
         prior = _weighted_mean(weighted)
         return prior, [w for w, _ in weighted]
@@ -723,7 +797,11 @@ def compute_prior(
 
 
 def _weighted_mean(weighted: list[tuple[QuotaWindow, float]]) -> float:
-    """Recency-weighted mean of window rates."""
+    """Legacy recency-weighted mean of window rates (averaging-averages).
+
+    Retained as a fallback for the legacy _extract_windows path.
+    The WS11 fix (pooled prior) is in compute_prior's spans.py branch.
+    """
     if not weighted:
         return 0.7
     total_w = sum(wt for _, wt in weighted)
@@ -850,6 +928,11 @@ def _build_burn_histogram(
 
     Cells with no qualifying burn are absent from both dicts (treated as 0 by
     the caller).  sample_counts is used by the WS7 per-cell prior blend.
+
+    NOTE: When spans.py is available, prefer _build_burn_histogram_from_spans()
+    which uses cleaned readings (Wrinkles 0-3 + running-max hygiene) to avoid
+    personal-account contamination.  This legacy function is retained as a
+    fallback for the prior-bucket path and for backwards compatibility.
     """
     # Restrict to work-account windows for the duty profile (personal account
     # is a different quota scale and rhythm).
@@ -905,6 +988,147 @@ def _build_burn_histogram(
             # NOTE: a long interval spanning multiple cells is attributed to its
             # midpoint cell. With ~20-min snapshot cadence this is fine; if
             # cadence drops we'd want to split across cells. Revisit if gaps grow.
+            mid = t_prev + (t_curr - t_prev) / 2
+            how = _hour_of_week(mid)
+            hist[how] = hist.get(how, 0.0) + delta
+            sample_counts[how] = sample_counts.get(how, 0) + 1
+
+    return hist, sample_counts
+
+
+def _build_burn_histogram_from_spans(
+    conn: sqlite3.Connection,
+    bucket: str,
+    spans: list,   # list[spans.Span] — typed as list for import flexibility
+    de_ration: bool,
+) -> tuple[dict[int, float], dict[int, int]]:
+    """WS12: Build the burn histogram from cleaned span readings.
+
+    Same logic as _build_burn_histogram but feeds on the cleaned readings
+    produced by spans.py (Wrinkles 0–3 + running-max data hygiene) rather than
+    raw _fetch_all_snapshots().
+
+    Key correctness improvements over the legacy function:
+    1. Personal-account readings (S5 / Wrinkle 1) are excluded — they were being
+       pulled in by the timestamp-range filter since S5 timestamps overlap S4's
+       calendar window.  Now we filter by resets_at so only readings labelled with
+       a work-account reset are considered.
+    2. Running-max-per-generation is applied within each span's reading window,
+       eliminating the cross-source ±1 jitter and stale late-arriving label gotchas
+       documented in "Data hygiene gotchas — raw readings".
+    3. Censoring (Wrinkle 3) is correctly applied: each span knows its own
+       end_ts (cap instant for censored spans) rather than relying on the window's
+       peak_pct heuristic.
+
+    Parameters match _build_burn_histogram so the caller (duty_surface) can
+    swap them transparently.  Returns the same (hist, sample_counts) shape.
+    """
+    from spans import Span as _SpanType  # local import to avoid circular
+
+    # Work-account spans only; discard personal, in-progress, and thin spans
+    # for the shape (we want the WHEN profile to reflect real work rhythm).
+    # For the histogram, in-progress spans ARE included — they show current-week
+    # activity and contribute to the WHEN shape even if excluded from the prior.
+    work_spans = [s for s in spans if s.exclude_reason not in ('personal', 'thin')]
+    if not work_spans:
+        return {}, {}
+
+    # Fetch all non-garbage readings once, keyed by (canonical resets_at, ts).
+    # We only include readings whose resets_at maps to a work-account generation.
+    # This is the key fix: filtering by resets_at (not just timestamp) ensures
+    # personal-account readings (which carry a different resets_at label) are
+    # excluded even when their timestamps overlap a work-account time window.
+
+    # Build set of canonical resets_at values for work spans
+    # (use .strftime to match against DB string format)
+    work_resets_ats_dt = {s.resets_at for s in work_spans}
+
+    # Also build the canonical_map from raw labels to datetime (for matching)
+    from spans import _canonicalise_resets_at as _canon_fn, _parse as _spans_parse
+
+    raw_rows = conn.execute(
+        "SELECT snapshot_ts, pct_used, resets_at FROM quota_snapshots "
+        "WHERE bucket=? ORDER BY snapshot_ts ASC",
+        (bucket,),
+    ).fetchall()
+
+    # Filter garbage and build canonical map for all raw resets_at in DB
+    from spans import GARBAGE_RESETS as _SPANS_GARBAGE
+    raw_rows = [(ts, pct, ra) for ts, pct, ra in raw_rows if ra not in _SPANS_GARBAGE]
+    if not raw_rows:
+        return {}, {}
+
+    raw_labels = list({ra for _, _, ra in raw_rows})
+    canon_map = _canon_fn(raw_labels)  # raw_label -> canonical datetime
+
+    # Group readings by canonical resets_at datetime
+    gen_readings: dict[datetime, list[tuple[datetime, float]]] = {}
+    for ts_s, pct, ra_s in raw_rows:
+        canon_dt = canon_map.get(ra_s)
+        if canon_dt is None:
+            continue
+        # Only include readings from work-account generations (Wrinkle 1 filter)
+        if canon_dt not in work_resets_ats_dt:
+            continue
+        try:
+            ts_dt = _spans_parse(ts_s)
+        except (ValueError, OverflowError):
+            continue
+        gen_readings.setdefault(canon_dt, []).append((ts_dt, pct))
+
+    for canon_dt in gen_readings:
+        gen_readings[canon_dt].sort(key=lambda x: x[0])
+
+    # Build a lookup: span -> (sub_start, sub_end, is_censored)
+    # Each span has its own sub-start/end (respects Wrinkle-2 splits and
+    # Wrinkle-3 cap instants); we process readings within each span's boundary.
+
+    hist: dict[int, float] = {}
+    sample_counts: dict[int, int] = {}
+
+    for span in work_spans:
+        # Readings from this span's generation only
+        raw_readings = gen_readings.get(span.resets_at, [])
+        if not raw_readings:
+            continue
+
+        # Collect readings within this span's time window
+        sub_raw = [
+            (ts, pct) for ts, pct in raw_readings
+            if span.start_ts <= ts <= span.end_ts
+        ]
+        if not sub_raw:
+            continue
+
+        # Apply running-max (data hygiene: cross-source jitter + stale arrivals)
+        from spans import _running_max_readings
+        sub_clean = _running_max_readings(sub_raw)
+
+        for i in range(1, len(sub_clean)):
+            t_prev, pct_prev = sub_clean[i - 1]
+            t_curr, pct_curr = sub_clean[i]
+            gap_h = (t_curr - t_prev).total_seconds() / 3600.0
+            if gap_h <= 0:
+                continue
+            delta = pct_curr - pct_prev
+            if delta <= 0:
+                continue  # flat or reset — not burn (running-max means all deltas ≥ 0)
+            # Hygiene: reset/account-switch jump
+            if delta > JUMP_DELTA_PP and gap_h < JUMP_MAX_GAP_H:
+                continue
+            rate = delta / gap_h
+            # Idle floor
+            if rate < IDLE_FLOOR_PP_H:
+                continue
+
+            # De-rationing exclusions for the target (natural) surface
+            if de_ration:
+                if pct_prev >= RATIONING_PCT_THRESHOLD:
+                    continue
+                # Use span.is_censored (correctly identifies cap from Wrinkle 3)
+                if span.is_censored:
+                    continue
+
             mid = t_prev + (t_curr - t_prev) / 2
             how = _hour_of_week(mid)
             hist[how] = hist.get(how, 0.0) + delta
@@ -1106,9 +1330,21 @@ def duty_surface(
         else:
             reset_dt = now + timedelta(days=7)
 
-    windows = _extract_windows(conn, bucket, now)
     de_ration = (surface_kind == 'natural')
-    hist, sample_counts = _build_burn_histogram(conn, bucket, windows, de_ration=de_ration)
+
+    # WS12: Use span-cleaned readings when spans.py is available.
+    # This eliminates personal-account contamination (S5 readings bleed into
+    # S4's calendar window) and applies running-max data hygiene.
+    # Falls back to the legacy _extract_windows path when spans.py is absent.
+    if _SPANS_AVAILABLE:
+        spans = _spans_extract(conn, bucket, now)
+        hist, sample_counts = _build_burn_histogram_from_spans(
+            conn, bucket, spans, de_ration=de_ration
+        )
+    else:
+        windows = _extract_windows(conn, bucket, now)
+        hist, sample_counts = _build_burn_histogram(conn, bucket, windows, de_ration=de_ration)
+
     if de_ration:
         hist = _impute_natural_cells(hist)
 
@@ -1124,10 +1360,17 @@ def duty_surface(
     effective_prior_bucket = prior_bucket if prior_bucket else bucket
     if effective_prior_bucket != bucket:
         # Fetch and normalise the prior bucket's histogram.
-        prior_windows = _extract_windows(conn, effective_prior_bucket, now)
-        prior_hist, _prior_counts = _build_burn_histogram(
-            conn, effective_prior_bucket, prior_windows, de_ration=de_ration
-        )
+        # WS12: use span-cleaned path for the prior bucket too.
+        if _SPANS_AVAILABLE:
+            prior_spans = _spans_extract(conn, effective_prior_bucket, now)
+            prior_hist, _prior_counts = _build_burn_histogram_from_spans(
+                conn, effective_prior_bucket, prior_spans, de_ration=de_ration
+            )
+        else:
+            prior_windows = _extract_windows(conn, effective_prior_bucket, now)
+            prior_hist, _prior_counts = _build_burn_histogram(
+                conn, effective_prior_bucket, prior_windows, de_ration=de_ration
+            )
         if de_ration:
             prior_hist = _impute_natural_cells(prior_hist)
         prior_weights = _histogram_to_weights(prior_hist)
@@ -1171,24 +1414,34 @@ def duty_surface(
 # ---------------------------------------------------------------------------
 
 def _get_effective_reset_epoch(conn: sqlite3.Connection, bucket: str,
-                               resets_at_dt: datetime) -> datetime:
+                               resets_at_dt: datetime,
+                               now: Optional[datetime] = None) -> datetime:
     """Return the effective start of the current quota window.
 
-    Prefers reset_history, falls back to monotonicity-break detection,
-    then to resets_at - 7 days.
+    Phase A stale-epoch fix (WS10):
+      epoch = max([history boundaries ≤ now] + [resets_at − 7d])
+
+    The presumed weekly boundary (resets_at − 7d) is a PEER candidate in the
+    max(), not just a fallback.  The old code returned max(history ≤ now) and
+    only used resets_at−7d if history was empty — so the Jun-09 21:30 history
+    entry was reported as the epoch even though the current week started
+    Jun-13 00:00 (resets_at_dt − 7d = Jun-20 − 7d = Jun-13).
+
+    Delegates to spans.get_effective_epoch() when spans.py is available.
     """
-    # Check reset_history first
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    if _SPANS_AVAILABLE:
+        return _spans_get_epoch(conn, bucket, resets_at_dt, now)
+
+    # Fallback (spans.py not importable): replicate the fix inline
     _ensure_reset_history(conn)
     history = _get_reset_history_boundaries(conn, bucket)
-    if history:
-        # The most recent boundary before now is the start of the current window
-        now = datetime.now(timezone.utc)
-        recent = [b for b in history if b <= now]
-        if recent:
-            return max(recent)
-
-    # Fall back to resets_at - 7 days
-    return resets_at_dt - timedelta(days=7)
+    recent = [b for b in history if b <= now]
+    weekly_boundary = resets_at_dt - timedelta(days=7)
+    candidates = recent + [weekly_boundary]
+    return max(candidates)
 
 
 def _get_latest_snapshot(conn: sqlite3.Connection, bucket: str) -> Optional[tuple[str, float, str]]:
@@ -1293,8 +1546,8 @@ def project(
         # Existing burn_rate.py logic: derived epoch = resets_at - 7 days
         epoch_dt = reset_dt - timedelta(days=7)
     else:
-        # Use reset_history if available, else monotonicity-break detection
-        epoch_dt = _get_effective_reset_epoch(conn, bucket, reset_dt)
+        # Phase A: use epoch fix (history-boundary + weekly-boundary peer max)
+        epoch_dt = _get_effective_reset_epoch(conn, bucket, reset_dt, now)
         notes.append(f"Reset epoch: {epoch_dt.isoformat()}")
 
     elapsed_h = (now - epoch_dt).total_seconds() / 3600.0
@@ -1399,6 +1652,358 @@ def project(
         prior_window_count=prior_window_count,
         notes=notes,
     )
+
+
+# ---------------------------------------------------------------------------
+# WS16: 5h activity-weighted shrinkage projection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FiveHourProjectionResult:
+    """Result of project_five_hour().
+
+    All time values are in seconds.  The headline field is
+    `projected_pct_at_reset` — the activity-weighted shrinkage estimate
+    (optimistic floor: accounts for idle time, shrunk toward prior).
+
+    `naive_projected_pct` is the raw wall-clock upper bound (pct/elapsed × full
+    window), useful as the upper end of the predicted range displayed in the
+    report.  For Phase F: predicted: <floor>% → <rtc>% by reset.
+    """
+    current_pct: float
+    elapsed_wall_s: float          # wall seconds since window start
+    active_elapsed_s: float        # active (non-idle) seconds elapsed
+    idle_s: float                  # idle seconds excluded from denominator
+    active_fraction: float         # active_elapsed / wall_elapsed (clamped)
+    obs_active_rate_pp_s: float    # observed pp per active second
+    prior_rate_pp_s: float         # trailing ~5h activity rate (prior)
+    blended_rate_pp_s: float       # shrinkage-blended per-active-second rate
+    projected_pct_at_reset: float  # floor/optimistic: blended_rate × expected_active_remaining
+    naive_projected_pct: float     # upper bound: naive wall-clock (pct/elapsed × full window)
+    path: str                      # 'activity_weighted' | 'naive_fallback'
+    notes: list[str]
+
+
+def _compute_active_elapsed_from_snapshots(
+    snapshots: list[tuple[datetime, float]],
+    wall_elapsed_s: float,
+) -> float:
+    """Compute active elapsed seconds by excluding idle gaps.
+
+    A gap between consecutive snapshots is considered idle if the implied
+    burn rate over that gap is below IDLE_FLOOR_PP_H.  This mirrors the same
+    logic used in the duty-surface histogram to distinguish active vs idle
+    sessions.
+
+    Parameters
+    ----------
+    snapshots : sorted [(ts, pct), ...] for the current 5h window
+    wall_elapsed_s : total wall seconds elapsed (for fallback)
+
+    Returns
+    -------
+    active_elapsed_s : float  (seconds that were genuinely active)
+    """
+    if len(snapshots) < 2:
+        return wall_elapsed_s   # can't determine activity from a single point
+
+    active_s = 0.0
+    for i in range(1, len(snapshots)):
+        t_prev, pct_prev = snapshots[i - 1]
+        t_curr, pct_curr = snapshots[i]
+        gap_s = (t_curr - t_prev).total_seconds()
+        if gap_s <= 0:
+            continue
+        gap_h = gap_s / 3600.0
+        delta = pct_curr - pct_prev
+        # Only count positive-delta (burning) intervals toward active time.
+        # Flat or decreasing intervals are idle (or a reset — excluded upstream).
+        if delta > 0:
+            rate_pp_h = delta / gap_h
+            if rate_pp_h >= IDLE_FLOOR_PP_H:
+                # Active interval
+                active_s += gap_s
+            # Sub-floor positive delta: small enough to be noise/idle session —
+            # not counted as active time.
+    return active_s
+
+
+def _compute_prior_rate_from_snapshots(
+    snapshots: list[tuple[datetime, float]],
+    window_start: datetime,
+    prior_wall_s: float = 5 * 3600.0,
+) -> Optional[float]:
+    """Compute the trailing activity-rate prior from recent snapshots.
+
+    Uses the last `prior_wall_s` seconds of wall time (default = one full 5h
+    window) as the trailing window for the prior.  Within that window, only
+    active intervals (rate >= IDLE_FLOOR_PP_H) are counted — same as
+    _compute_active_elapsed_from_snapshots.
+
+    Returns pp per active second, or None if there are no active intervals in
+    the trailing window.
+
+    This prior anchors the shrinkage to recent activity, not a historical
+    average.  For the 5h bucket there is no multi-week history to draw from
+    (unlike the weekly buckets), so the prior is derived from the recent same-
+    window activity rather than from completed past windows.
+    """
+    if len(snapshots) < 2:
+        return None
+
+    # Trailing window boundary: start at (last_ts - prior_wall_s) or window_start
+    last_ts = snapshots[-1][0]
+    trailing_start = max(window_start, last_ts - timedelta(seconds=prior_wall_s))
+
+    sum_pp = 0.0
+    sum_active_s = 0.0
+
+    for i in range(1, len(snapshots)):
+        t_prev, pct_prev = snapshots[i - 1]
+        t_curr, pct_curr = snapshots[i]
+        # Only consider intervals starting at or after trailing_start
+        if t_curr <= trailing_start:
+            continue
+        # Clamp to trailing window
+        seg_start = max(t_prev, trailing_start)
+        gap_s = (t_curr - seg_start).total_seconds()
+        if gap_s <= 0:
+            continue
+        gap_h = gap_s / 3600.0
+        delta = pct_curr - pct_prev
+        if delta <= 0:
+            continue
+        rate_pp_h = delta / gap_h
+        if rate_pp_h >= IDLE_FLOOR_PP_H:
+            sum_pp += delta
+            sum_active_s += gap_s
+
+    if sum_active_s <= 0:
+        return None
+    return sum_pp / sum_active_s   # pp per active second
+
+
+def project_five_hour(
+    conn: sqlite3.Connection,
+    now: Optional[datetime] = None,
+) -> Optional[FiveHourProjectionResult]:
+    """WS16: Activity-weighted shrinkage projection for the five_hour bucket.
+
+    Design (see WS16 in Burn-Rate_Plugin_Consolidation.md):
+
+    1. Active-rate denominator: exclude idle gaps (rate < IDLE_FLOOR_PP_H)
+       from the elapsed-time denominator.  Avoids naive wall-clock extrapolation
+       that swings wildly (5% → 102% → 89% → 105% on noise) because early
+       snapshots may reflect a mostly-idle window.
+
+    2. Shrinkage prior: trailing ~5h activity rate (last full window's worth of
+       active intervals).  K = 1h (3600s).  At elapsed=K the observed and prior
+       rates are weighted equally; at elapsed >> K the projection is
+       observation-dominated.
+
+       Blended = (obs_active_rate × active_elapsed + prior_rate × K) /
+                 (active_elapsed + K)
+
+    3. Project over active-hours-remaining (units consistency — WS13 lesson):
+       per-active-second rate × expected-active-seconds-remaining.
+
+       expected_active_s_remaining = active_fraction × wall_s_remaining
+
+       where active_fraction = active_elapsed / wall_elapsed,
+       clamped to [FIVE_HOUR_ACTIVE_FRAC_MIN, FIVE_HOUR_ACTIVE_FRAC_MAX].
+
+    4. Account-separation limitation: no Saturday-reset anchor to distinguish
+       work vs personal account for the 5h bucket.  All-account tokens used.
+       See FIVE_HOUR_ACCOUNT_NOTE.
+
+    Falls back to the naive wall-clock path when:
+      - active_elapsed_s < FIVE_HOUR_MIN_ACTIVE_S (div-zero guard)
+      - No data / no reset timestamp
+
+    Returns FiveHourProjectionResult or None if no 5h snapshot exists.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    # --- Fetch latest snapshot ---
+    row = conn.execute(
+        "SELECT snapshot_ts, pct_used, resets_at FROM quota_snapshots "
+        "WHERE bucket='five_hour' AND resets_at NOT IN ('2286-11-20T17:46:39Z') "
+        "ORDER BY snapshot_ts DESC LIMIT 1",
+    ).fetchone()
+    if row is None:
+        return None
+
+    ts_str, current_pct, resets_at_raw = row
+    if not resets_at_raw:
+        return None
+
+    try:
+        reset_dt = _to_utc(_parse_iso(resets_at_raw))
+        window_start = reset_dt - timedelta(hours=5)
+        wall_elapsed_s = (now - window_start).total_seconds()
+        wall_s_remaining = (reset_dt - now).total_seconds()
+    except Exception:
+        return None
+
+    if wall_elapsed_s <= 0 or wall_s_remaining <= 0:
+        return None
+
+    # --- Fetch all snapshots for current 5h window ---
+    snapshots_raw = conn.execute(
+        "SELECT snapshot_ts, pct_used FROM quota_snapshots "
+        "WHERE bucket='five_hour' AND resets_at=? "
+        "ORDER BY snapshot_ts ASC",
+        (resets_at_raw,),
+    ).fetchall()
+
+    snapshots: list[tuple[datetime, float]] = []
+    for ts_s, pct in snapshots_raw:
+        try:
+            ts_dt = _to_utc(_parse_iso(ts_s))
+            if window_start <= ts_dt <= now:
+                snapshots.append((ts_dt, pct))
+        except Exception:
+            continue
+
+    notes: list[str] = [FIVE_HOUR_ACCOUNT_NOTE]
+
+    # Naive fallback values (always computable)
+    naive_rate_pp_s = current_pct / wall_elapsed_s if wall_elapsed_s > 0 else 0.0
+    naive_proj = current_pct + naive_rate_pp_s * wall_s_remaining
+
+    # --- Compute active elapsed seconds ---
+    active_elapsed_s = _compute_active_elapsed_from_snapshots(snapshots, wall_elapsed_s)
+
+    # Guard: if active elapsed is negligible, fall back to naive
+    if active_elapsed_s < FIVE_HOUR_MIN_ACTIVE_S:
+        notes.append(
+            f"Active elapsed {active_elapsed_s:.0f}s < min {FIVE_HOUR_MIN_ACTIVE_S:.0f}s — "
+            f"using naive wall-clock path"
+        )
+        return FiveHourProjectionResult(
+            current_pct=current_pct,
+            elapsed_wall_s=wall_elapsed_s,
+            active_elapsed_s=active_elapsed_s,
+            idle_s=wall_elapsed_s - active_elapsed_s,
+            active_fraction=0.0,
+            obs_active_rate_pp_s=0.0,
+            prior_rate_pp_s=0.0,
+            blended_rate_pp_s=naive_rate_pp_s,
+            projected_pct_at_reset=naive_proj,
+            naive_projected_pct=naive_proj,
+            path='naive_fallback',
+            notes=notes,
+        )
+
+    # --- Per-active-second observed rate ---
+    obs_active_rate_pp_s = current_pct / active_elapsed_s
+
+    # --- Prior: trailing ~5h activity rate ---
+    prior_rate_pp_s_raw = _compute_prior_rate_from_snapshots(
+        snapshots, window_start, prior_wall_s=5 * 3600.0
+    )
+    if prior_rate_pp_s_raw is None:
+        # No active intervals found for prior — use observed rate as its own prior
+        # (shrinkage will be neutral; projection still benefits from active denominator)
+        prior_rate_pp_s = obs_active_rate_pp_s
+        notes.append("Prior fallback: no trailing active intervals — using observed rate as prior")
+    else:
+        prior_rate_pp_s = prior_rate_pp_s_raw
+        notes.append(
+            f"Prior: {prior_rate_pp_s * 3600:.4f} pp/hr active "
+            f"(trailing ~5h activity, K={FIVE_HOUR_K_SECONDS/3600:.1f}h)"
+        )
+
+    # --- Shrinkage blend ---
+    # blended = (obs * active_elapsed + prior * K) / (active_elapsed + K)
+    K = FIVE_HOUR_K_SECONDS
+    blended_rate_pp_s = (
+        (obs_active_rate_pp_s * active_elapsed_s + prior_rate_pp_s * K)
+        / (active_elapsed_s + K)
+    )
+    notes.append(
+        f"Shrinkage: obs={obs_active_rate_pp_s*3600:.4f} pp/hr-active × {active_elapsed_s:.0f}s "
+        f"+ prior={prior_rate_pp_s*3600:.4f} pp/hr-active × K={K:.0f}s → "
+        f"blended={blended_rate_pp_s*3600:.4f} pp/hr-active"
+    )
+
+    # --- Active fraction (clamped) ---
+    active_fraction = active_elapsed_s / wall_elapsed_s
+    active_fraction = max(FIVE_HOUR_ACTIVE_FRAC_MIN, min(FIVE_HOUR_ACTIVE_FRAC_MAX, active_fraction))
+    notes.append(
+        f"Active fraction: {active_fraction:.2f} "
+        f"(raw={active_elapsed_s/wall_elapsed_s:.2f}, "
+        f"clamped to [{FIVE_HOUR_ACTIVE_FRAC_MIN}, {FIVE_HOUR_ACTIVE_FRAC_MAX}])"
+    )
+
+    # --- Project over active-hours-remaining (WS13 units consistency) ---
+    # NEVER multiply a per-active-second rate by wall seconds remaining.
+    expected_active_s_remaining = active_fraction * wall_s_remaining
+    projected_pct = current_pct + blended_rate_pp_s * expected_active_s_remaining
+    notes.append(
+        f"Projection: {current_pct:.1f}% + {blended_rate_pp_s*3600:.4f} pp/hr-active "
+        f"× {expected_active_s_remaining/3600:.2f}h active-remaining "
+        f"= {projected_pct:.1f}%"
+    )
+
+    return FiveHourProjectionResult(
+        current_pct=current_pct,
+        elapsed_wall_s=wall_elapsed_s,
+        active_elapsed_s=active_elapsed_s,
+        idle_s=wall_elapsed_s - active_elapsed_s,
+        active_fraction=active_fraction,
+        obs_active_rate_pp_s=obs_active_rate_pp_s,
+        prior_rate_pp_s=prior_rate_pp_s,
+        blended_rate_pp_s=blended_rate_pp_s,
+        projected_pct_at_reset=projected_pct,
+        naive_projected_pct=naive_proj,
+        path='activity_weighted',
+        notes=notes,
+    )
+
+
+def stability_demo_5h(
+    pct: float,
+    elapsed_wall_s: float,
+    active_fraction: float,
+    prior_rate_pp_h: float = 1.0,
+) -> float:
+    """Simulate a single 5h projection for the stability demo.
+
+    Used by --test-5h-stability to show that small noise in early-window data
+    no longer produces wild swings (5% → 102% → 89% → 105%).
+
+    Parameters:
+      pct               : current % used
+      elapsed_wall_s    : seconds elapsed in window so far
+      active_fraction   : fraction of elapsed time that was active (0–1)
+      prior_rate_pp_h   : prior active rate in pp/hr
+
+    Returns: projected % at end of 5h window.
+    """
+    total_window_s = 5 * 3600.0
+    wall_s_remaining = total_window_s - elapsed_wall_s
+    if wall_s_remaining <= 0:
+        return pct
+
+    active_elapsed_s = active_fraction * elapsed_wall_s
+    if active_elapsed_s < FIVE_HOUR_MIN_ACTIVE_S:
+        # naive fallback
+        naive_rate = pct / elapsed_wall_s if elapsed_wall_s > 0 else 0.0
+        return pct + naive_rate * wall_s_remaining
+
+    obs_active_rate_pp_s = pct / active_elapsed_s
+    prior_rate_pp_s = prior_rate_pp_h / 3600.0
+    K = FIVE_HOUR_K_SECONDS
+    blended_rate_pp_s = (
+        (obs_active_rate_pp_s * active_elapsed_s + prior_rate_pp_s * K)
+        / (active_elapsed_s + K)
+    )
+    active_fraction_clamped = max(FIVE_HOUR_ACTIVE_FRAC_MIN,
+                                   min(FIVE_HOUR_ACTIVE_FRAC_MAX, active_fraction))
+    expected_active_s_remaining = active_fraction_clamped * wall_s_remaining
+    return pct + blended_rate_pp_s * expected_active_s_remaining
 
 
 # ---------------------------------------------------------------------------
