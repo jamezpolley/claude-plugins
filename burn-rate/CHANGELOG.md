@@ -5,6 +5,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [1.2.0] — 2026-06-14
+
+### Added
+
+- **`/burn-rate-setup` skill** (`skills/burn-rate-setup/`) — wires the quota strip
+  into the user's statusline, making the plugin portable to a fresh install. The
+  Stop hook and `/burn-rate` report were already portable (auto-registered;
+  `${CLAUDE_PLUGIN_ROOT}`); the statusline strip was not, because the statusline
+  command is the user's own file that a plugin can't write. `setup-statusline.py`
+  is an idempotent injector with three paths: (1) no statusLine configured →
+  create one and point `settings.json` at it; (2) statusLine is a script → append
+  a marker-delimited block (no-op if already wired); (3) inline command → print
+  the snippet to add by hand. Dry-run by default, `--apply` writes, backs up first.
+  The injected lookup is marketplace-agnostic (matches `burn-rate@<any>`), so it
+  survives version bumps and re-installs.
+
+---
+
 ## [1.1.0] — 2026-06-14
 
 The span-based projection rebuild. Projections are now computed from explicitly
