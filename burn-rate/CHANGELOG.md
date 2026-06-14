@@ -5,6 +5,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [1.1.0] — 2026-06-14
+
+The span-based projection rebuild. Projections are now computed from explicitly
+defined **spans** (account- and reset-correct windows) rather than slicing a single
+mixed timeline, fixing personal-account contamination, stale-epoch elapsed, and
+averaging-of-averages inflation.
+
+### Added
+
+- **`spans.py` (new module)** — the clean-readings/span engine. Groups readings by
+  `resets_at` generation, discards personal-account spans (Wrinkle 1: work = Saturday
+  00:00 UTC reset), splits weeks at mid-week resets (Wrinkle 2), canonicalises
+  near-coincident reset labels (Wrinkle 0), and treats censored spans correctly
+  (Wrinkle 3). Data-hygiene: running-max per generation defeats cross-source ±1
+  disagreement and stale late-arriving readings.
+- **Account-separation stamp (WS17)** — `quota_snapshots` gains a nullable
+  `seven_day_resets_at` column. The 5h bucket has no account anchor of its own, so
+  writers stamp the co-captured 7d `resets_at` onto `five_hour` / `sonnet_weekly`
+  rows; `spans.py` classifies those rows work-vs-personal off the stamp. Historical
+  rows stay NULL (the 5h prior is recent-anchored).
+- **`--autonomous-status --json`** — structured per-bucket fields for deterministic
+  consumers, alongside the human-readable text and the 0/1/2 exit-code contract.
+- **`--color=auto|always|never` / `-c`** on the human report.
+
+### Changed
+
+- **Report restructure** — the per-bucket view is now two lines: `predicted:` shows a
+  **range** `LOW–HIGH% at reset` (duty/optimistic-floor → round-the-clock upper bound,
+  glyph/colour escalating off the upper end), and `target:` shows the pace needed to
+  land at 100% (`≤X pp/hr from here · N× over/under`). Replaces the old ETA/duty lines.
+  Internals (eff_rate, prior, K, wins, active%) move behind `--verbose`.
+- **Pooled prior (WS11)** — the historical rate prior is now a pooled
+  `Σ(wᵢ·Δppᵢ)/Σ(wᵢ·hoursᵢ)` rather than an average of per-span rates (which inflated
+  ~14.6%; 0.927 → 0.809 pp/hr on current data).
+- **Duty surface (WS12)** built on clean span readings — removes 121pp of
+  personal-account contamination from the weekday×hour histogram.
+- **5h projection (WS16)** — activity-weighted shrinkage over *active* hours with a
+  recent-rate prior (K=1h), replacing naive wall-clock extrapolation. Early-window
+  volatility ±24% → ±3.7%.
+- **Report colour ramp** switched to basic 16-colour SGR so `watch -c` renders it
+  (procps-ng strips 256-colour); the statusline keeps its 256-colour gradient.
+
+### Fixed
+
+- **Personal-account contamination** — a 62% personal-account endpoint no longer bleeds
+  into the work window (spans group + discard by account).
+- **Stale-epoch elapsed** — effective reset epoch is `max(reset_history ≤ now,
+  resets_at − 7d)`; the presumed weekly boundary is no longer fallback-only (current
+  window elapsed reads 11.6h, not 86h).
+
+---
+
 ## [1.0.7] — 2026-06-13
 
 ### Changed
