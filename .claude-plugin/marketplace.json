@@ -10,7 +10,11 @@
   "plugins": [
     {
       "name": "burn-rate",
-      "source": "./burn-rate/",
+      "source": {
+        "source": "url",
+        "url": "https://gitlab.com/tchaypo/burn-rate.git",
+        "ref": "main"
+      },
       "description": "Claude Code quota burn-rate reporting — % used, pp/hr, projected exhaustion of weekly buckets from ~/.claude/state/usage-log.sqlite",
       "keywords": [
         "quota",
